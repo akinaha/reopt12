@@ -3,12 +3,12 @@
  * nodeHashjoin.c
  *	  Routines to handle hash join nodes
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeHashjoin.c,v 1.101 2009/06/11 14:48:57 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/executor/nodeHashjoin.c,v 1.93 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -21,9 +21,6 @@
 #include "executor/nodeHashjoin.h"
 #include "utils/memutils.h"
 
-
-/* Returns true for JOIN_LEFT and JOIN_ANTI jointypes */
-#define HASHJOIN_IS_OUTER(hjstate)	((hjstate)->hj_NullInnerTupleSlot != NULL)
 
 static TupleTableSlot *ExecHashJoinOuterGetTuple(PlanState *outerNode,
 						  HashJoinState *hjstate,
@@ -93,6 +90,14 @@ ExecHashJoin(HashJoinState *node)
 	}
 
 	/*
+	 * If we're doing an IN join, we want to return at most one row per outer
+	 * tuple; so we can stop scanning the inner scan if we matched on the
+	 * previous try.
+	 */
+	if (node->js.jointype == JOIN_IN && node->hj_MatchedOuter)
+		node->hj_NeedNewOuter = true;
+
+	/*
 	 * Reset per-tuple memory context to free any expression evaluation
 	 * storage allocated in the previous tuple cycle.  Note this can't happen
 	 * until we're done projecting out tuples from a join tuple.
@@ -124,7 +129,7 @@ ExecHashJoin(HashJoinState *node)
 		 * outer plan node.  If we succeed, we have to stash it away for later
 		 * consumption by ExecHashJoinOuterGetTuple.
 		 */
-		if (HASHJOIN_IS_OUTER(node) ||
+		if (node->js.jointype == JOIN_LEFT ||
 			(outerNode->plan->startup_cost < hashNode->ps.plan->total_cost &&
 			 !node->hj_OuterNotEmpty))
 		{
@@ -157,7 +162,7 @@ ExecHashJoin(HashJoinState *node)
 		 * If the inner relation is completely empty, and we're not doing an
 		 * outer join, we can quit without scanning the outer relation.
 		 */
-		if (hashtable->totalTuples == 0 && !HASHJOIN_IS_OUTER(node))
+		if (hashtable->totalTuples == 0 && node->js.jointype != JOIN_LEFT)
 			return NULL;
 
 		/*
@@ -193,28 +198,25 @@ ExecHashJoin(HashJoinState *node)
 				return NULL;
 			}
 
+			node->js.ps.ps_OuterTupleSlot = outerTupleSlot;
 			econtext->ecxt_outertuple = outerTupleSlot;
 			node->hj_NeedNewOuter = false;
 			node->hj_MatchedOuter = false;
 
 			/*
-			 * Now we have an outer tuple; find the corresponding bucket for
-			 * this tuple in the main hash table or skew hash table.
+			 * now we have an outer tuple, find the corresponding bucket for
+			 * this tuple from the hash table
 			 */
 			node->hj_CurHashValue = hashvalue;
 			ExecHashGetBucketAndBatch(hashtable, hashvalue,
 									  &node->hj_CurBucketNo, &batchno);
-			node->hj_CurSkewBucketNo = ExecHashGetSkewBucket(hashtable,
-															 hashvalue);
 			node->hj_CurTuple = NULL;
 
 			/*
 			 * Now we've got an outer tuple and the corresponding hash bucket,
-			 * but it might not belong to the current batch, or it might match
-			 * a skew bucket.
+			 * but this tuple may not belong to the current batch.
 			 */
-			if (batchno != hashtable->curbatch &&
-				node->hj_CurSkewBucketNo == INVALID_SKEW_BUCKET_NO)
+			if (batchno != hashtable->curbatch)
 			{
 				/*
 				 * Need to postpone this outer tuple to a later batch. Save it
@@ -261,20 +263,6 @@ ExecHashJoin(HashJoinState *node)
 			{
 				node->hj_MatchedOuter = true;
 
-				/* In an antijoin, we never return a matched tuple */
-				if (node->js.jointype == JOIN_ANTI)
-				{
-					node->hj_NeedNewOuter = true;
-					break;		/* out of loop over hash bucket */
-				}
-
-				/*
-				 * In a semijoin, we'll consider returning the first match,
-				 * but after that we're done with this outer tuple.
-				 */
-				if (node->js.jointype == JOIN_SEMI)
-					node->hj_NeedNewOuter = true;
-
 				if (otherqual == NIL || ExecQual(otherqual, econtext, false))
 				{
 					TupleTableSlot *result;
@@ -290,11 +278,13 @@ ExecHashJoin(HashJoinState *node)
 				}
 
 				/*
-				 * If semijoin and we didn't return the tuple, we're still
-				 * done with this outer tuple.
+				 * If we didn't return a tuple, may need to set NeedNewOuter
 				 */
-				if (node->js.jointype == JOIN_SEMI)
+				if (node->js.jointype == JOIN_IN)
+				{
+					node->hj_NeedNewOuter = true;
 					break;		/* out of loop over hash bucket */
+				}
 			}
 		}
 
@@ -306,7 +296,7 @@ ExecHashJoin(HashJoinState *node)
 		node->hj_NeedNewOuter = true;
 
 		if (!node->hj_MatchedOuter &&
-			HASHJOIN_IS_OUTER(node))
+			node->js.jointype == JOIN_LEFT)
 		{
 			/*
 			 * We are doing an outer join and there were no join matches for
@@ -315,7 +305,7 @@ ExecHashJoin(HashJoinState *node)
 			 */
 			econtext->ecxt_innertuple = node->hj_NullInnerTupleSlot;
 
-			if (otherqual == NIL || ExecQual(otherqual, econtext, false))
+			if (ExecQual(otherqual, econtext, false))
 			{
 				/*
 				 * qualification was satisfied so we project and return the
@@ -408,14 +398,12 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	ExecInitResultTupleSlot(estate, &hjstate->js.ps);
 	hjstate->hj_OuterTupleSlot = ExecInitExtraTupleSlot(estate);
 
-	/* note: HASHJOIN_IS_OUTER macro depends on this initialization */
 	switch (node->join.jointype)
 	{
 		case JOIN_INNER:
-		case JOIN_SEMI:
+		case JOIN_IN:
 			break;
 		case JOIN_LEFT:
-		case JOIN_ANTI:
 			hjstate->hj_NullInnerTupleSlot =
 				ExecInitNullTupleSlot(estate,
 								 ExecGetResultType(innerPlanState(hjstate)));
@@ -456,7 +444,6 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 
 	hjstate->hj_CurHashValue = 0;
 	hjstate->hj_CurBucketNo = 0;
-	hjstate->hj_CurSkewBucketNo = INVALID_SKEW_BUCKET_NO;
 	hjstate->hj_CurTuple = NULL;
 
 	/*
@@ -486,6 +473,7 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	/* child Hash node needs to evaluate inner hash keys, too */
 	((HashState *) innerPlanState(hjstate))->hashkeys = rclauses;
 
+	hjstate->js.ps.ps_OuterTupleSlot = NULL;
 	hjstate->js.ps.ps_TupFromTlist = false;
 	hjstate->hj_NeedNewOuter = true;
 	hjstate->hj_MatchedOuter = false;
@@ -582,7 +570,7 @@ ExecHashJoinOuterGetTuple(PlanState *outerNode,
 			if (ExecHashGetHashValue(hashtable, econtext,
 									 hjstate->hj_OuterHashKeys,
 									 true,		/* outer tuple */
-									 HASHJOIN_IS_OUTER(hjstate),
+									 (hjstate->js.jointype == JOIN_LEFT),
 									 hashvalue))
 			{
 				/* remember outer relation is not empty for possible rescan */
@@ -656,26 +644,13 @@ start_over:
 			BufFileClose(hashtable->outerBatchFile[curbatch]);
 		hashtable->outerBatchFile[curbatch] = NULL;
 	}
-	else	/* we just finished the first batch */
-	{
-		/*
-		 * Reset some of the skew optimization state variables, since we no
-		 * longer need to consider skew tuples after the first batch. The
-		 * memory context reset we are about to do will release the skew
-		 * hashtable itself.
-		 */
-		hashtable->skewEnabled = false;
-		hashtable->skewBucket = NULL;
-		hashtable->skewBucketNums = NULL;
-		hashtable->spaceUsedSkew = 0;
-	}
 
 	/*
 	 * We can always skip over any batches that are completely empty on both
 	 * sides.  We can sometimes skip over batches that are empty on only one
 	 * side, but there are exceptions:
 	 *
-	 * 1. In an outer join, we have to process outer batches even if the inner
+	 * 1. In a LEFT JOIN, we have to process outer batches even if the inner
 	 * batch is empty.
 	 *
 	 * 2. If we have increased nbatch since the initial estimate, we have to
@@ -692,7 +667,7 @@ start_over:
 			hashtable->innerBatchFile[curbatch] == NULL))
 	{
 		if (hashtable->outerBatchFile[curbatch] &&
-			HASHJOIN_IS_OUTER(hjstate))
+			hjstate->js.jointype == JOIN_LEFT)
 			break;				/* must process due to rule 1 */
 		if (hashtable->innerBatchFile[curbatch] &&
 			nbatch != hashtable->nbatch_original)
@@ -898,9 +873,9 @@ ExecReScanHashJoin(HashJoinState *node, ExprContext *exprCtxt)
 	/* Always reset intra-tuple state */
 	node->hj_CurHashValue = 0;
 	node->hj_CurBucketNo = 0;
-	node->hj_CurSkewBucketNo = INVALID_SKEW_BUCKET_NO;
 	node->hj_CurTuple = NULL;
 
+	node->js.ps.ps_OuterTupleSlot = NULL;
 	node->js.ps.ps_TupFromTlist = false;
 	node->hj_NeedNewOuter = true;
 	node->hj_MatchedOuter = false;

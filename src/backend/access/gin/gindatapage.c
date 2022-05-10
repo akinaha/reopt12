@@ -4,19 +4,16 @@
  *	  page utilities routines for the postgres inverted index access method.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *			$PostgreSQL: pgsql/src/backend/access/gin/gindatapage.c,v 1.16 2009/06/11 14:48:53 momjian Exp $
+ *			$PostgreSQL: pgsql/src/backend/access/gin/gindatapage.c,v 1.9 2008/01/01 19:45:46 momjian Exp $
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
-
 #include "access/gin.h"
-#include "storage/bufmgr.h"
-#include "utils/rel.h"
 
 int
 compareItemPointers(ItemPointer a, ItemPointer b)
@@ -32,14 +29,10 @@ compareItemPointers(ItemPointer a, ItemPointer b)
 }
 
 /*
- * Merge two ordered arrays of itempointers, eliminating any duplicates.
- * Returns the number of items in the result.
- * Caller is responsible that there is enough space at *dst.
+ * Merge two ordered array of itempointer
  */
-uint32
-MergeItemPointers(ItemPointerData *dst,
-				  ItemPointerData *a, uint32 na,
-				  ItemPointerData *b, uint32 nb)
+void
+MergeItemPointers(ItemPointerData *dst, ItemPointerData *a, uint32 na, ItemPointerData *b, uint32 nb)
 {
 	ItemPointerData *dptr = dst;
 	ItemPointerData *aptr = a,
@@ -47,16 +40,8 @@ MergeItemPointers(ItemPointerData *dst,
 
 	while (aptr - a < na && bptr - b < nb)
 	{
-		int			cmp = compareItemPointers(aptr, bptr);
-
-		if (cmp > 0)
+		if (compareItemPointers(aptr, bptr) > 0)
 			*dptr++ = *bptr++;
-		else if (cmp == 0)
-		{
-			/* we want only one copy of the identical items */
-			*dptr++ = *bptr++;
-			aptr++;
-		}
 		else
 			*dptr++ = *aptr++;
 	}
@@ -66,8 +51,6 @@ MergeItemPointers(ItemPointerData *dst,
 
 	while (bptr - b < nb)
 		*dptr++ = *bptr++;
-
-	return dptr - dst;
 }
 
 /*
@@ -459,7 +442,7 @@ dataSplitPage(GinBtree btree, Buffer lbuf, Buffer rbuf, OffsetNumber off, XLogRe
 	char	   *ptr;
 	OffsetNumber separator;
 	ItemPointer bound;
-	Page		lpage = PageGetTempPageCopy(BufferGetPage(lbuf));
+	Page		lpage = GinPageGetCopyPage(BufferGetPage(lbuf));
 	ItemPointerData oldbound = *GinDataPageGetRightBound(lpage);
 	int			sizeofitem = GinSizeOfItem(lpage);
 	OffsetNumber maxoff = GinPageGetOpaque(lpage)->maxoff;
@@ -644,16 +627,11 @@ insertItemPointer(GinPostingTreeScan *gdi, ItemPointerData *items, uint32 nitem)
 		gdi->stack = ginFindLeafPage(&gdi->btree, gdi->stack);
 
 		if (gdi->btree.findItem(&(gdi->btree), gdi->stack))
-		{
-			/*
-			 * gdi->btree.items[gdi->btree.curitem] already exists in index
-			 */
-			gdi->btree.curitem++;
-			LockBuffer(gdi->stack->buffer, GIN_UNLOCK);
-			freeGinBtreeStack(gdi->stack);
-		}
-		else
-			ginInsertValue(&(gdi->btree), gdi->stack);
+			elog(ERROR, "item pointer (%u,%d) already exists",
+			ItemPointerGetBlockNumber(gdi->btree.items + gdi->btree.curitem),
+				 ItemPointerGetOffsetNumber(gdi->btree.items + gdi->btree.curitem));
+
+		ginInsertValue(&(gdi->btree), gdi->stack);
 
 		gdi->stack = NULL;
 	}

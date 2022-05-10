@@ -4,7 +4,7 @@
 #    Makefile for main
 #
 # IDENTIFICATION
-#    $PostgreSQL: pgsql/src/backend/main/Makefile,v 1.12 2008/02/19 10:30:07 petere Exp $
+#    $PostgreSQL: pgsql/src/backend/main/Makefile,v 1.11 2007/01/20 17:16:11 petere Exp $
 #
 #-------------------------------------------------------------------------
 
@@ -14,4 +14,10 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = main.o
 
-include $(top_srcdir)/src/backend/common.mk
+all: SUBSYS.o
+
+SUBSYS.o: $(OBJS)
+	$(LD) $(LDREL) $(LDOUT) SUBSYS.o $(OBJS)
+
+clean: 
+	rm -f SUBSYS.o $(OBJS) 

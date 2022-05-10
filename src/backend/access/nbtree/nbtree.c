@@ -8,11 +8,11 @@
  *	  This file contains only the public interface routines.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/nbtree/nbtree.c,v 1.171 2009/06/11 14:48:54 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/access/nbtree/nbtree.c,v 1.156 2008/01/01 19:45:46 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -20,14 +20,9 @@
 
 #include "access/genam.h"
 #include "access/nbtree.h"
-#include "access/relscan.h"
 #include "catalog/index.h"
-#include "catalog/storage.h"
 #include "commands/vacuum.h"
-#include "storage/bufmgr.h"
 #include "storage/freespace.h"
-#include "storage/indexfsm.h"
-#include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "utils/memutils.h"
 
@@ -57,7 +52,9 @@ typedef struct
 	IndexBulkDeleteCallback callback;
 	void	   *callback_state;
 	BTCycleId	cycleid;
-	BlockNumber lastUsedPage;
+	BlockNumber *freePages;
+	int			nFreePages;		/* number of entries in freePages[] */
+	int			maxFreePages;	/* allocated size of freePages[] */
 	BlockNumber totFreePages;	/* true total # of free pages */
 	MemoryContext pagedelcontext;
 } BTVacState;
@@ -119,7 +116,7 @@ btbuild(PG_FUNCTION_ARGS)
 		buildstate.spool2 = _bt_spoolinit(index, false, true);
 
 	/* do the heap scan */
-	reltuples = IndexBuildHeapScan(heap, index, indexInfo, true,
+	reltuples = IndexBuildHeapScan(heap, index, indexInfo,
 								   btbuildCallback, (void *) &buildstate);
 
 	/* okay, all heap tuples are indexed */
@@ -242,9 +239,6 @@ btgettuple(PG_FUNCTION_ARGS)
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	bool		res;
 
-	/* btree indexes are never lossy */
-	scan->xs_recheck = false;
-
 	/*
 	 * If we've already initialized this scan, we can just advance it in the
 	 * appropriate direction.  If we haven't done so yet, we call a routine to
@@ -284,29 +278,42 @@ btgettuple(PG_FUNCTION_ARGS)
 }
 
 /*
- * btgetbitmap() -- gets all matching tuples, and adds them to a bitmap
+ * btgetmulti() -- get multiple tuples at once
+ *
+ * In the current implementation there seems no strong reason to stop at
+ * index page boundaries; we just press on until we fill the caller's buffer
+ * or run out of matches.
  */
 Datum
-btgetbitmap(PG_FUNCTION_ARGS)
+btgetmulti(PG_FUNCTION_ARGS)
 {
 	IndexScanDesc scan = (IndexScanDesc) PG_GETARG_POINTER(0);
-	TIDBitmap  *tbm = (TIDBitmap *) PG_GETARG_POINTER(1);
+	ItemPointer tids = (ItemPointer) PG_GETARG_POINTER(1);
+	int32		max_tids = PG_GETARG_INT32(2);
+	int32	   *returned_tids = (int32 *) PG_GETARG_POINTER(3);
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
-	int64		ntids = 0;
-	ItemPointer heapTid;
+	bool		res = true;
+	int32		ntids = 0;
 
-	/* Fetch the first page & tuple. */
-	if (!_bt_first(scan, ForwardScanDirection))
+	if (max_tids <= 0)			/* behave correctly in boundary case */
+		PG_RETURN_BOOL(true);
+
+	/* If we haven't started the scan yet, fetch the first page & tuple. */
+	if (!BTScanPosIsValid(so->currPos))
 	{
-		/* empty scan */
-		PG_RETURN_INT64(0);
+		res = _bt_first(scan, ForwardScanDirection);
+		if (!res)
+		{
+			/* empty scan */
+			*returned_tids = ntids;
+			PG_RETURN_BOOL(res);
+		}
+		/* Save tuple ID, and continue scanning */
+		tids[ntids] = scan->xs_ctup.t_self;
+		ntids++;
 	}
-	/* Save tuple ID, and continue scanning */
-	heapTid = &scan->xs_ctup.t_self;
-	tbm_add_tuples(tbm, heapTid, 1, false);
-	ntids++;
 
-	for (;;)
+	while (ntids < max_tids)
 	{
 		/*
 		 * Advance to next tuple within page.  This is the same as the easy
@@ -315,17 +322,18 @@ btgetbitmap(PG_FUNCTION_ARGS)
 		if (++so->currPos.itemIndex > so->currPos.lastItem)
 		{
 			/* let _bt_next do the heavy lifting */
-			if (!_bt_next(scan, ForwardScanDirection))
+			res = _bt_next(scan, ForwardScanDirection);
+			if (!res)
 				break;
 		}
 
 		/* Save tuple ID, and continue scanning */
-		heapTid = &so->currPos.items[so->currPos.itemIndex].heapTid;
-		tbm_add_tuples(tbm, heapTid, 1, false);
+		tids[ntids] = so->currPos.items[so->currPos.itemIndex].heapTid;
 		ntids++;
 	}
 
-	PG_RETURN_INT64(ntids);
+	*returned_tids = ntids;
+	PG_RETURN_BOOL(res);
 }
 
 /*
@@ -530,15 +538,21 @@ btbulkdelete(PG_FUNCTION_ARGS)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
 	/* Establish the vacuum cycle ID to use for this scan */
-	/* The ENSURE stuff ensures we clean up shared memory on failure */
-	PG_ENSURE_ERROR_CLEANUP(_bt_end_vacuum_callback, PointerGetDatum(rel));
+	PG_TRY();
 	{
 		cycleid = _bt_start_vacuum(rel);
 
 		btvacuumscan(info, stats, callback, callback_state, cycleid);
+
+		_bt_end_vacuum(rel);
 	}
-	PG_END_ENSURE_ERROR_CLEANUP(_bt_end_vacuum_callback, PointerGetDatum(rel));
-	_bt_end_vacuum(rel);
+	PG_CATCH();
+	{
+		/* Make sure shared memory gets cleaned up */
+		_bt_end_vacuum(rel);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	PG_RETURN_POINTER(stats);
 }
@@ -553,10 +567,6 @@ btvacuumcleanup(PG_FUNCTION_ARGS)
 {
 	IndexVacuumInfo *info = (IndexVacuumInfo *) PG_GETARG_POINTER(0);
 	IndexBulkDeleteResult *stats = (IndexBulkDeleteResult *) PG_GETARG_POINTER(1);
-
-	/* No-op in ANALYZE ONLY mode */
-	if (info->analyze_only)
-		PG_RETURN_POINTER(stats);
 
 	/*
 	 * If btbulkdelete was called, we need not do anything, just return the
@@ -573,16 +583,13 @@ btvacuumcleanup(PG_FUNCTION_ARGS)
 		btvacuumscan(info, stats, NULL, NULL, 0);
 	}
 
-	/* Finally, vacuum the FSM */
-	IndexFreeSpaceMapVacuum(info->index);
-
 	/*
 	 * During a non-FULL vacuum it's quite possible for us to be fooled by
 	 * concurrent page splits into double-counting some index tuples, so
-	 * disbelieve any total that exceeds the underlying heap's count ... if we
-	 * know that accurately.  Otherwise this might just make matters worse.
+	 * disbelieve any total that exceeds the underlying heap's count. (We
+	 * can't check this during btbulkdelete.)
 	 */
-	if (!info->vacuum_full && !info->estimated_count)
+	if (!info->vacuum_full)
 	{
 		if (stats->num_index_tuples > info->num_heap_tuples)
 			stats->num_index_tuples = info->num_heap_tuples;
@@ -618,7 +625,6 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 * Reset counts that will be incremented during the scan; needed in case
 	 * of multiple scans during a single VACUUM command
 	 */
-	stats->estimated_count = false;
 	stats->num_index_tuples = 0;
 	stats->pages_deleted = 0;
 
@@ -628,7 +634,9 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	vstate.callback = callback;
 	vstate.callback_state = callback_state;
 	vstate.cycleid = cycleid;
-	vstate.lastUsedPage = BTREE_METAPAGE;
+	vstate.freePages = NULL;	/* temporarily */
+	vstate.nFreePages = 0;
+	vstate.maxFreePages = 0;
 	vstate.totFreePages = 0;
 
 	/* Create a temporary memory context to run _bt_pagedel in */
@@ -673,6 +681,17 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		if (needLock)
 			UnlockRelationForExtension(rel, ExclusiveLock);
 
+		/* Allocate freePages after we read num_pages the first time */
+		if (vstate.freePages == NULL)
+		{
+			/* No point in remembering more than MaxFSMPages pages */
+			vstate.maxFreePages = MaxFSMPages;
+			if ((BlockNumber) vstate.maxFreePages > num_pages)
+				vstate.maxFreePages = (int) num_pages;
+			vstate.freePages = (BlockNumber *)
+				palloc(vstate.maxFreePages * sizeof(BlockNumber));
+		}
+
 		/* Quit if we've scanned the whole relation */
 		if (blkno >= num_pages)
 			break;
@@ -689,20 +708,41 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 * acquiring exclusive lock on the index and then rechecking all the
 	 * pages; doesn't seem worth it.
 	 */
-	if (info->vacuum_full && vstate.lastUsedPage < num_pages - 1)
+	if (info->vacuum_full && vstate.nFreePages > 0)
 	{
-		BlockNumber new_pages = vstate.lastUsedPage + 1;
+		BlockNumber new_pages = num_pages;
 
-		/*
-		 * Okay to truncate.
-		 */
-		RelationTruncate(rel, new_pages);
+		while (vstate.nFreePages > 0 &&
+			   vstate.freePages[vstate.nFreePages - 1] == new_pages - 1)
+		{
+			new_pages--;
+			stats->pages_deleted--;
+			vstate.nFreePages--;
+			vstate.totFreePages = vstate.nFreePages;	/* can't be more */
+		}
+		if (new_pages != num_pages)
+		{
+			/*
+			 * Okay to truncate.
+			 */
+			RelationTruncate(rel, new_pages);
 
-		/* update statistics */
-		stats->pages_removed += num_pages - new_pages;
-		vstate.totFreePages -= (num_pages - new_pages);
-		num_pages = new_pages;
+			/* update statistics */
+			stats->pages_removed += num_pages - new_pages;
+
+			num_pages = new_pages;
+		}
 	}
+
+	/*
+	 * Update the shared Free Space Map with the info we now have about free
+	 * pages in the index, discarding any old info the map may have. We do not
+	 * need to sort the page numbers; they're in order already.
+	 */
+	RecordIndexFreeSpace(&rel->rd_node, vstate.totFreePages,
+						 vstate.nFreePages, vstate.freePages);
+
+	pfree(vstate.freePages);
 
 	MemoryContextDelete(vstate.pagedelcontext);
 
@@ -749,8 +789,7 @@ restart:
 	 * recycle all-zero pages, not fail.  Also, we want to use a nondefault
 	 * buffer access strategy.
 	 */
-	buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
-							 info->strategy);
+	buf = ReadBufferWithStrategy(rel, blkno, info->strategy);
 	LockBuffer(buf, BT_READ);
 	page = BufferGetPage(buf);
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
@@ -760,7 +799,8 @@ restart:
 	/*
 	 * If we are recursing, the only case we want to do anything with is a
 	 * live leaf page having the current vacuum cycle ID.  Any other state
-	 * implies we already saw the page (eg, deleted it as being empty).
+	 * implies we already saw the page (eg, deleted it as being empty). In
+	 * particular, we don't want to risk adding it to freePages twice.
 	 */
 	if (blkno != orig_blkno)
 	{
@@ -774,15 +814,12 @@ restart:
 		}
 	}
 
-	/* If the page is in use, update lastUsedPage */
-	if (!_bt_page_recyclable(page) && vstate->lastUsedPage < blkno)
-		vstate->lastUsedPage = blkno;
-
 	/* Page is valid, see what to do with it */
 	if (_bt_page_recyclable(page))
 	{
 		/* Okay to recycle this page */
-		RecordFreeIndexPage(rel, blkno);
+		if (vstate->nFreePages < vstate->maxFreePages)
+			vstate->freePages[vstate->nFreePages++] = blkno;
 		vstate->totFreePages++;
 		stats->pages_deleted++;
 	}
@@ -918,7 +955,8 @@ restart:
 		 */
 		if (ndel && info->vacuum_full)
 		{
-			RecordFreeIndexPage(rel, blkno);
+			if (vstate->nFreePages < vstate->maxFreePages)
+				vstate->freePages[vstate->nFreePages++] = blkno;
 			vstate->totFreePages++;
 		}
 

@@ -3,12 +3,12 @@
  * be-fsstubs.c
  *	  Builtin functions for open/close/read/write operations on large objects
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/libpq/be-fsstubs.c,v 1.91 2009/06/11 14:48:58 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/libpq/be-fsstubs.c,v 1.87 2008/01/01 19:45:49 momjian Exp $
  *
  * NOTES
  *	  This should be moved to a more appropriate place.  It is here
@@ -47,7 +47,6 @@
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/large_object.h"
-#include "utils/builtins.h"
 #include "utils/memutils.h"
 
 
@@ -80,7 +79,6 @@ static MemoryContext fscxt = NULL;
 
 static int	newLOfd(LargeObjectDesc *lobjCookie);
 static void deleteLOfd(int fd);
-static Oid	lo_import_internal(text *filename, Oid lobjOid);
 
 
 /*****************************************************************************
@@ -321,34 +319,14 @@ lowrite(PG_FUNCTION_ARGS)
 Datum
 lo_import(PG_FUNCTION_ARGS)
 {
-	text	   *filename = PG_GETARG_TEXT_PP(0);
-
-	PG_RETURN_OID(lo_import_internal(filename, InvalidOid));
-}
-
-/*
- * lo_import_with_oid -
- *	  imports a file as an (inversion) large object specifying oid.
- */
-Datum
-lo_import_with_oid(PG_FUNCTION_ARGS)
-{
-	text	   *filename = PG_GETARG_TEXT_PP(0);
-	Oid			oid = PG_GETARG_OID(1);
-
-	PG_RETURN_OID(lo_import_internal(filename, oid));
-}
-
-static Oid
-lo_import_internal(text *filename, Oid lobjOid)
-{
+	text	   *filename = PG_GETARG_TEXT_P(0);
 	File		fd;
 	int			nbytes,
 				tmp;
 	char		buf[BUFSIZE];
 	char		fnamebuf[MAXPGPATH];
 	LargeObjectDesc *lobj;
-	Oid			oid;
+	Oid			lobjOid;
 
 #ifndef ALLOW_DANGEROUS_LO_FUNCTIONS
 	if (!superuser())
@@ -363,7 +341,11 @@ lo_import_internal(text *filename, Oid lobjOid)
 	/*
 	 * open the file to be read in
 	 */
-	text_to_cstring_buffer(filename, fnamebuf, sizeof(fnamebuf));
+	nbytes = VARSIZE(filename) - VARHDRSZ;
+	if (nbytes >= MAXPGPATH)
+		nbytes = MAXPGPATH - 1;
+	memcpy(fnamebuf, VARDATA(filename), nbytes);
+	fnamebuf[nbytes] = '\0';
 	fd = PathNameOpenFile(fnamebuf, O_RDONLY | PG_BINARY, 0666);
 	if (fd < 0)
 		ereport(ERROR,
@@ -374,12 +356,12 @@ lo_import_internal(text *filename, Oid lobjOid)
 	/*
 	 * create an inversion object
 	 */
-	oid = inv_create(lobjOid);
+	lobjOid = inv_create(InvalidOid);
 
 	/*
 	 * read in from the filesystem and write to the inversion object
 	 */
-	lobj = inv_open(oid, INV_WRITE, fscxt);
+	lobj = inv_open(lobjOid, INV_WRITE, fscxt);
 
 	while ((nbytes = FileRead(fd, buf, BUFSIZE)) > 0)
 	{
@@ -396,7 +378,7 @@ lo_import_internal(text *filename, Oid lobjOid)
 	inv_close(lobj);
 	FileClose(fd);
 
-	return oid;
+	PG_RETURN_OID(lobjOid);
 }
 
 /*
@@ -407,7 +389,7 @@ Datum
 lo_export(PG_FUNCTION_ARGS)
 {
 	Oid			lobjId = PG_GETARG_OID(0);
-	text	   *filename = PG_GETARG_TEXT_PP(1);
+	text	   *filename = PG_GETARG_TEXT_P(1);
 	File		fd;
 	int			nbytes,
 				tmp;
@@ -438,7 +420,11 @@ lo_export(PG_FUNCTION_ARGS)
 	 * 022. This code used to drop it all the way to 0, but creating
 	 * world-writable export files doesn't seem wise.
 	 */
-	text_to_cstring_buffer(filename, fnamebuf, sizeof(fnamebuf));
+	nbytes = VARSIZE(filename) - VARHDRSZ;
+	if (nbytes >= MAXPGPATH)
+		nbytes = MAXPGPATH - 1;
+	memcpy(fnamebuf, VARDATA(filename), nbytes);
+	fnamebuf[nbytes] = '\0';
 	oumask = umask((mode_t) 0022);
 	fd = PathNameOpenFile(fnamebuf, O_CREAT | O_WRONLY | O_TRUNC | PG_BINARY, 0666);
 	umask(oumask);

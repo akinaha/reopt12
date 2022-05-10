@@ -4,12 +4,12 @@
  * bootscanner.l
  *	  a lexical scanner for the bootstrap parser
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/bootstrap/bootscanner.l,v 1.48 2009/01/01 17:23:36 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/bootstrap/bootscanner.l,v 1.45 2008/01/01 19:45:48 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -37,7 +37,7 @@
 #include "utils/rel.h"
 
 /* Not needed now that this file is compiled as part of bootparse. */
-/* #include "bootparse.h" */
+/* #include "bootstrap_tokens.h" */
 
 
 /* Avoid exit() on fatal scanner errors (a bit ugly -- see yy_fatal_error) */
@@ -52,7 +52,6 @@ static int	yyline = 1;			/* line number for error reporting */
 %option 8bit
 %option never-interactive
 %option nodefault
-%option noinput
 %option nounput
 %option noyywrap
 %option prefix="boot_yy"

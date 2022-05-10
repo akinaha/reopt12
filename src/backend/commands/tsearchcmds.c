@@ -4,12 +4,12 @@
  *
  *	  Routines for tsearch manipulation commands
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/tsearchcmds.c,v 1.17 2009/06/11 14:48:56 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/tsearchcmds.c,v 1.9 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -43,9 +43,7 @@
 #include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
-#include "utils/rel.h"
 #include "utils/syscache.h"
-#include "utils/tqual.h"
 
 
 static void MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
@@ -167,7 +165,7 @@ DefineTSParser(List *names, List *parameters)
 	Relation	prsRel;
 	HeapTuple	tup;
 	Datum		values[Natts_pg_ts_parser];
-	bool		nulls[Natts_pg_ts_parser];
+	char		nulls[Natts_pg_ts_parser];
 	NameData	pname;
 	Oid			prsOid;
 	Oid			namespaceoid;
@@ -182,7 +180,7 @@ DefineTSParser(List *names, List *parameters)
 
 	/* initialize tuple fields with name/namespace */
 	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
+	memset(nulls, ' ', sizeof(nulls));
 
 	namestrcpy(&pname, prsname);
 	values[Anum_pg_ts_parser_prsname - 1] = NameGetDatum(&pname);
@@ -255,7 +253,7 @@ DefineTSParser(List *names, List *parameters)
 	 */
 	prsRel = heap_open(TSParserRelationId, RowExclusiveLock);
 
-	tup = heap_form_tuple(prsRel->rd_att, values, nulls);
+	tup = heap_formtuple(prsRel->rd_att, values, nulls);
 
 	prsOid = simple_heap_insert(prsRel, tup);
 
@@ -272,59 +270,40 @@ DefineTSParser(List *names, List *parameters)
  * DROP TEXT SEARCH PARSER
  */
 void
-RemoveTSParsers(DropStmt *drop)
+RemoveTSParser(List *names, DropBehavior behavior, bool missing_ok)
 {
-	ObjectAddresses *objects;
-	ListCell   *cell;
+	Oid			prsOid;
+	ObjectAddress object;
 
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to drop text search parsers")));
 
-	/*
-	 * First we identify all the objects, then we delete them in a single
-	 * performMultipleDeletions() call.  This is to avoid unwanted DROP
-	 * RESTRICT errors if one of the objects depends on another.
-	 */
-	objects = new_object_addresses();
-
-	foreach(cell, drop->objects)
+	prsOid = TSParserGetPrsid(names, true);
+	if (!OidIsValid(prsOid))
 	{
-		List	   *names = (List *) lfirst(cell);
-		Oid			prsOid;
-		ObjectAddress object;
-
-		prsOid = TSParserGetPrsid(names, true);
-
-		if (!OidIsValid(prsOid))
+		if (!missing_ok)
 		{
-			if (!drop->missing_ok)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("text search parser \"%s\" does not exist",
-								NameListToString(names))));
-			}
-			else
-			{
-				ereport(NOTICE,
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("text search parser \"%s\" does not exist",
+							NameListToString(names))));
+		}
+		else
+		{
+			ereport(NOTICE,
 				(errmsg("text search parser \"%s\" does not exist, skipping",
 						NameListToString(names))));
-			}
-			continue;
 		}
-
-		object.classId = TSParserRelationId;
-		object.objectId = prsOid;
-		object.objectSubId = 0;
-
-		add_exact_object_address(&object, objects);
+		return;
 	}
 
-	performMultipleDeletions(objects, drop->behavior);
+	object.classId = TSParserRelationId;
+	object.objectId = prsOid;
+	object.objectSubId = 0;
 
-	free_object_addresses(objects);
+	performDeletion(&object, behavior);
 }
 
 /*
@@ -497,7 +476,7 @@ DefineTSDictionary(List *names, List *parameters)
 	Relation	dictRel;
 	HeapTuple	tup;
 	Datum		values[Natts_pg_ts_dict];
-	bool		nulls[Natts_pg_ts_dict];
+	char		nulls[Natts_pg_ts_dict];
 	NameData	dname;
 	Oid			templId = InvalidOid;
 	List	   *dictoptions = NIL;
@@ -547,7 +526,7 @@ DefineTSDictionary(List *names, List *parameters)
 	 * Looks good, insert
 	 */
 	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
+	memset(nulls, ' ', sizeof(nulls));
 
 	namestrcpy(&dname, dictname);
 	values[Anum_pg_ts_dict_dictname - 1] = NameGetDatum(&dname);
@@ -558,11 +537,11 @@ DefineTSDictionary(List *names, List *parameters)
 		values[Anum_pg_ts_dict_dictinitoption - 1] =
 			PointerGetDatum(serialize_deflist(dictoptions));
 	else
-		nulls[Anum_pg_ts_dict_dictinitoption - 1] = true;
+		nulls[Anum_pg_ts_dict_dictinitoption - 1] = 'n';
 
 	dictRel = heap_open(TSDictionaryRelationId, RowExclusiveLock);
 
-	tup = heap_form_tuple(dictRel->rd_att, values, nulls);
+	tup = heap_formtuple(dictRel->rd_att, values, nulls);
 
 	dictOid = simple_heap_insert(dictRel, tup);
 
@@ -633,72 +612,54 @@ RenameTSDictionary(List *oldname, const char *newname)
  * DROP TEXT SEARCH DICTIONARY
  */
 void
-RemoveTSDictionaries(DropStmt *drop)
+RemoveTSDictionary(List *names, DropBehavior behavior, bool missing_ok)
 {
-	ObjectAddresses *objects;
-	ListCell   *cell;
+	Oid			dictOid;
+	ObjectAddress object;
+	HeapTuple	tup;
+	Oid			namespaceId;
 
-	/*
-	 * First we identify all the objects, then we delete them in a single
-	 * performMultipleDeletions() call.  This is to avoid unwanted DROP
-	 * RESTRICT errors if one of the objects depends on another.
-	 */
-	objects = new_object_addresses();
-
-	foreach(cell, drop->objects)
+	dictOid = TSDictionaryGetDictid(names, true);
+	if (!OidIsValid(dictOid))
 	{
-		List	   *names = (List *) lfirst(cell);
-		Oid			dictOid;
-		ObjectAddress object;
-		HeapTuple	tup;
-		Oid			namespaceId;
-
-		dictOid = TSDictionaryGetDictid(names, true);
-
-		if (!OidIsValid(dictOid))
+		if (!missing_ok)
 		{
-			if (!drop->missing_ok)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_OBJECT),
-					   errmsg("text search dictionary \"%s\" does not exist",
-							  NameListToString(names))));
-			}
-			else
-			{
-				ereport(NOTICE,
-						(errmsg("text search dictionary \"%s\" does not exist, skipping",
-								NameListToString(names))));
-			}
-			continue;
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("text search dictionary \"%s\" does not exist",
+							NameListToString(names))));
 		}
-
-		tup = SearchSysCache(TSDICTOID,
-							 ObjectIdGetDatum(dictOid),
-							 0, 0, 0);
-		if (!HeapTupleIsValid(tup))		/* should not happen */
-			elog(ERROR, "cache lookup failed for text search dictionary %u",
-				 dictOid);
-
-		/* Permission check: must own dictionary or its namespace */
-		namespaceId = ((Form_pg_ts_dict) GETSTRUCT(tup))->dictnamespace;
-		if (!pg_ts_dict_ownercheck(dictOid, GetUserId()) &&
-			!pg_namespace_ownercheck(namespaceId, GetUserId()))
-			aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_TSDICTIONARY,
-						   NameListToString(names));
-
-		object.classId = TSDictionaryRelationId;
-		object.objectId = dictOid;
-		object.objectSubId = 0;
-
-		add_exact_object_address(&object, objects);
-
-		ReleaseSysCache(tup);
+		else
+		{
+			ereport(NOTICE,
+			(errmsg("text search dictionary \"%s\" does not exist, skipping",
+					NameListToString(names))));
+		}
+		return;
 	}
 
-	performMultipleDeletions(objects, drop->behavior);
+	tup = SearchSysCache(TSDICTOID,
+						 ObjectIdGetDatum(dictOid),
+						 0, 0, 0);
 
-	free_object_addresses(objects);
+	if (!HeapTupleIsValid(tup)) /* should not happen */
+		elog(ERROR, "cache lookup failed for text search dictionary %u",
+			 dictOid);
+
+	/* Permission check: must own dictionary or its namespace */
+	namespaceId = ((Form_pg_ts_dict) GETSTRUCT(tup))->dictnamespace;
+	if (!pg_ts_dict_ownercheck(dictOid, GetUserId()) &&
+		!pg_namespace_ownercheck(namespaceId, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_TSDICTIONARY,
+					   NameListToString(names));
+
+	ReleaseSysCache(tup);
+
+	object.classId = TSDictionaryRelationId;
+	object.objectId = dictOid;
+	object.objectSubId = 0;
+
+	performDeletion(&object, behavior);
 }
 
 /*
@@ -742,8 +703,8 @@ AlterTSDictionary(AlterTSDictionaryStmt *stmt)
 	Datum		opt;
 	bool		isnull;
 	Datum		repl_val[Natts_pg_ts_dict];
-	bool		repl_null[Natts_pg_ts_dict];
-	bool		repl_repl[Natts_pg_ts_dict];
+	char		repl_null[Natts_pg_ts_dict];
+	char		repl_repl[Natts_pg_ts_dict];
 
 	dictId = TSDictionaryGetDictid(stmt->dictname, false);
 
@@ -813,18 +774,18 @@ AlterTSDictionary(AlterTSDictionaryStmt *stmt)
 	 * Looks good, update
 	 */
 	memset(repl_val, 0, sizeof(repl_val));
-	memset(repl_null, false, sizeof(repl_null));
-	memset(repl_repl, false, sizeof(repl_repl));
+	memset(repl_null, ' ', sizeof(repl_null));
+	memset(repl_repl, ' ', sizeof(repl_repl));
 
 	if (dictoptions)
 		repl_val[Anum_pg_ts_dict_dictinitoption - 1] =
 			PointerGetDatum(serialize_deflist(dictoptions));
 	else
-		repl_null[Anum_pg_ts_dict_dictinitoption - 1] = true;
-	repl_repl[Anum_pg_ts_dict_dictinitoption - 1] = true;
+		repl_null[Anum_pg_ts_dict_dictinitoption - 1] = 'n';
+	repl_repl[Anum_pg_ts_dict_dictinitoption - 1] = 'r';
 
-	newtup = heap_modify_tuple(tup, RelationGetDescr(rel),
-							   repl_val, repl_null, repl_repl);
+	newtup = heap_modifytuple(tup, RelationGetDescr(rel),
+							  repl_val, repl_null, repl_repl);
 
 	simple_heap_update(rel, &newtup->t_self, newtup);
 
@@ -995,7 +956,7 @@ DefineTSTemplate(List *names, List *parameters)
 	Relation	tmplRel;
 	HeapTuple	tup;
 	Datum		values[Natts_pg_ts_template];
-	bool		nulls[Natts_pg_ts_template];
+	char		nulls[Natts_pg_ts_template];
 	NameData	dname;
 	int			i;
 	Oid			dictOid;
@@ -1012,7 +973,7 @@ DefineTSTemplate(List *names, List *parameters)
 
 	for (i = 0; i < Natts_pg_ts_template; i++)
 	{
-		nulls[i] = false;
+		nulls[i] = ' ';
 		values[i] = ObjectIdGetDatum(InvalidOid);
 	}
 
@@ -1031,13 +992,13 @@ DefineTSTemplate(List *names, List *parameters)
 		{
 			values[Anum_pg_ts_template_tmplinit - 1] =
 				get_ts_template_func(defel, Anum_pg_ts_template_tmplinit);
-			nulls[Anum_pg_ts_template_tmplinit - 1] = false;
+			nulls[Anum_pg_ts_template_tmplinit - 1] = ' ';
 		}
 		else if (pg_strcasecmp(defel->defname, "lexize") == 0)
 		{
 			values[Anum_pg_ts_template_tmpllexize - 1] =
 				get_ts_template_func(defel, Anum_pg_ts_template_tmpllexize);
-			nulls[Anum_pg_ts_template_tmpllexize - 1] = false;
+			nulls[Anum_pg_ts_template_tmpllexize - 1] = ' ';
 		}
 		else
 			ereport(ERROR,
@@ -1060,7 +1021,7 @@ DefineTSTemplate(List *names, List *parameters)
 
 	tmplRel = heap_open(TSTemplateRelationId, RowExclusiveLock);
 
-	tup = heap_form_tuple(tmplRel->rd_att, values, nulls);
+	tup = heap_formtuple(tmplRel->rd_att, values, nulls);
 
 	dictOid = simple_heap_insert(tmplRel, tup);
 
@@ -1124,59 +1085,40 @@ RenameTSTemplate(List *oldname, const char *newname)
  * DROP TEXT SEARCH TEMPLATE
  */
 void
-RemoveTSTemplates(DropStmt *drop)
+RemoveTSTemplate(List *names, DropBehavior behavior, bool missing_ok)
 {
-	ObjectAddresses *objects;
-	ListCell   *cell;
+	Oid			tmplOid;
+	ObjectAddress object;
 
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to drop text search templates")));
 
-	/*
-	 * First we identify all the objects, then we delete them in a single
-	 * performMultipleDeletions() call.  This is to avoid unwanted DROP
-	 * RESTRICT errors if one of the objects depends on another.
-	 */
-	objects = new_object_addresses();
-
-	foreach(cell, drop->objects)
+	tmplOid = TSTemplateGetTmplid(names, true);
+	if (!OidIsValid(tmplOid))
 	{
-		List	   *names = (List *) lfirst(cell);
-		Oid			tmplOid;
-		ObjectAddress object;
-
-		tmplOid = TSTemplateGetTmplid(names, true);
-
-		if (!OidIsValid(tmplOid))
+		if (!missing_ok)
 		{
-			if (!drop->missing_ok)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("text search template \"%s\" does not exist",
-								NameListToString(names))));
-			}
-			else
-			{
-				ereport(NOTICE,
-						(errmsg("text search template \"%s\" does not exist, skipping",
-								NameListToString(names))));
-			}
-			continue;
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("text search template \"%s\" does not exist",
+							NameListToString(names))));
 		}
-
-		object.classId = TSTemplateRelationId;
-		object.objectId = tmplOid;
-		object.objectSubId = 0;
-
-		add_exact_object_address(&object, objects);
+		else
+		{
+			ereport(NOTICE,
+			  (errmsg("text search template \"%s\" does not exist, skipping",
+					  NameListToString(names))));
+		}
+		return;
 	}
 
-	performMultipleDeletions(objects, drop->behavior);
+	object.classId = TSTemplateRelationId;
+	object.objectId = tmplOid;
+	object.objectSubId = 0;
 
-	free_object_addresses(objects);
+	performDeletion(&object, behavior);
 }
 
 /*
@@ -1255,7 +1197,7 @@ makeConfigurationDependencies(HeapTuple tuple, bool removeOld,
 	if (removeOld)
 	{
 		deleteDependencyRecordsFor(myself.classId, myself.objectId);
-		deleteSharedDependencyRecordsFor(myself.classId, myself.objectId, 0);
+		deleteSharedDependencyRecordsFor(myself.classId, myself.objectId);
 	}
 
 	/*
@@ -1327,7 +1269,7 @@ DefineTSConfiguration(List *names, List *parameters)
 	Relation	mapRel = NULL;
 	HeapTuple	tup;
 	Datum		values[Natts_pg_ts_config];
-	bool		nulls[Natts_pg_ts_config];
+	char		nulls[Natts_pg_ts_config];
 	AclResult	aclresult;
 	Oid			namespaceoid;
 	char	   *cfgname;
@@ -1403,7 +1345,7 @@ DefineTSConfiguration(List *names, List *parameters)
 	 * Looks good, build tuple and insert
 	 */
 	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
+	memset(nulls, ' ', sizeof(nulls));
 
 	namestrcpy(&cname, cfgname);
 	values[Anum_pg_ts_config_cfgname - 1] = NameGetDatum(&cname);
@@ -1413,7 +1355,7 @@ DefineTSConfiguration(List *names, List *parameters)
 
 	cfgRel = heap_open(TSConfigRelationId, RowExclusiveLock);
 
-	tup = heap_form_tuple(cfgRel->rd_att, values, nulls);
+	tup = heap_formtuple(cfgRel->rd_att, values, nulls);
 
 	cfgOid = simple_heap_insert(cfgRel, tup);
 
@@ -1443,17 +1385,17 @@ DefineTSConfiguration(List *names, List *parameters)
 			Form_pg_ts_config_map cfgmap = (Form_pg_ts_config_map) GETSTRUCT(maptup);
 			HeapTuple	newmaptup;
 			Datum		mapvalues[Natts_pg_ts_config_map];
-			bool		mapnulls[Natts_pg_ts_config_map];
+			char		mapnulls[Natts_pg_ts_config_map];
 
 			memset(mapvalues, 0, sizeof(mapvalues));
-			memset(mapnulls, false, sizeof(mapnulls));
+			memset(mapnulls, ' ', sizeof(mapnulls));
 
 			mapvalues[Anum_pg_ts_config_map_mapcfg - 1] = cfgOid;
 			mapvalues[Anum_pg_ts_config_map_maptokentype - 1] = cfgmap->maptokentype;
 			mapvalues[Anum_pg_ts_config_map_mapseqno - 1] = cfgmap->mapseqno;
 			mapvalues[Anum_pg_ts_config_map_mapdict - 1] = cfgmap->mapdict;
 
-			newmaptup = heap_form_tuple(mapRel->rd_att, mapvalues, mapnulls);
+			newmaptup = heap_formtuple(mapRel->rd_att, mapvalues, mapnulls);
 
 			simple_heap_insert(mapRel, newmaptup);
 
@@ -1531,66 +1473,48 @@ RenameTSConfiguration(List *oldname, const char *newname)
  * DROP TEXT SEARCH CONFIGURATION
  */
 void
-RemoveTSConfigurations(DropStmt *drop)
+RemoveTSConfiguration(List *names, DropBehavior behavior, bool missing_ok)
 {
-	ObjectAddresses *objects;
-	ListCell   *cell;
+	Oid			cfgOid;
+	Oid			namespaceId;
+	ObjectAddress object;
+	HeapTuple	tup;
 
-	/*
-	 * First we identify all the objects, then we delete them in a single
-	 * performMultipleDeletions() call.  This is to avoid unwanted DROP
-	 * RESTRICT errors if one of the objects depends on another.
-	 */
-	objects = new_object_addresses();
+	tup = GetTSConfigTuple(names);
 
-	foreach(cell, drop->objects)
+	if (!HeapTupleIsValid(tup))
 	{
-		List	   *names = (List *) lfirst(cell);
-		Oid			cfgOid;
-		Oid			namespaceId;
-		ObjectAddress object;
-		HeapTuple	tup;
-
-		tup = GetTSConfigTuple(names);
-
-		if (!HeapTupleIsValid(tup))
+		if (!missing_ok)
 		{
-			if (!drop->missing_ok)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_OBJECT),
-					errmsg("text search configuration \"%s\" does not exist",
-						   NameListToString(names))));
-			}
-			else
-			{
-				ereport(NOTICE,
-						(errmsg("text search configuration \"%s\" does not exist, skipping",
-								NameListToString(names))));
-			}
-			continue;
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("text search configuration \"%s\" does not exist",
+							NameListToString(names))));
 		}
-
-		/* Permission check: must own configuration or its namespace */
-		cfgOid = HeapTupleGetOid(tup);
-		namespaceId = ((Form_pg_ts_config) GETSTRUCT(tup))->cfgnamespace;
-		if (!pg_ts_config_ownercheck(cfgOid, GetUserId()) &&
-			!pg_namespace_ownercheck(namespaceId, GetUserId()))
-			aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_TSCONFIGURATION,
-						   NameListToString(names));
-
-		object.classId = TSConfigRelationId;
-		object.objectId = cfgOid;
-		object.objectSubId = 0;
-
-		add_exact_object_address(&object, objects);
-
-		ReleaseSysCache(tup);
+		else
+		{
+			ereport(NOTICE,
+					(errmsg("text search configuration \"%s\" does not exist, skipping",
+							NameListToString(names))));
+		}
+		return;
 	}
 
-	performMultipleDeletions(objects, drop->behavior);
+	/* Permission check: must own configuration or its namespace */
+	cfgOid = HeapTupleGetOid(tup);
+	namespaceId = ((Form_pg_ts_config) GETSTRUCT(tup))->cfgnamespace;
+	if (!pg_ts_config_ownercheck(cfgOid, GetUserId()) &&
+		!pg_namespace_ownercheck(namespaceId, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_TSCONFIGURATION,
+					   NameListToString(names));
 
-	free_object_addresses(objects);
+	ReleaseSysCache(tup);
+
+	object.classId = TSConfigRelationId;
+	object.objectId = cfgOid;
+	object.objectSubId = 0;
+
+	performDeletion(&object, behavior);
 }
 
 /*
@@ -1911,20 +1835,20 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 			if (cfgmap->mapdict == dictOld)
 			{
 				Datum		repl_val[Natts_pg_ts_config_map];
-				bool		repl_null[Natts_pg_ts_config_map];
-				bool		repl_repl[Natts_pg_ts_config_map];
+				char		repl_null[Natts_pg_ts_config_map];
+				char		repl_repl[Natts_pg_ts_config_map];
 				HeapTuple	newtup;
 
 				memset(repl_val, 0, sizeof(repl_val));
-				memset(repl_null, false, sizeof(repl_null));
-				memset(repl_repl, false, sizeof(repl_repl));
+				memset(repl_null, ' ', sizeof(repl_null));
+				memset(repl_repl, ' ', sizeof(repl_repl));
 
 				repl_val[Anum_pg_ts_config_map_mapdict - 1] = ObjectIdGetDatum(dictNew);
-				repl_repl[Anum_pg_ts_config_map_mapdict - 1] = true;
+				repl_repl[Anum_pg_ts_config_map_mapdict - 1] = 'r';
 
-				newtup = heap_modify_tuple(maptup,
-										   RelationGetDescr(relMap),
-										   repl_val, repl_null, repl_repl);
+				newtup = heap_modifytuple(maptup,
+										  RelationGetDescr(relMap),
+										  repl_val, repl_null, repl_repl);
 				simple_heap_update(relMap, &newtup->t_self, newtup);
 
 				CatalogUpdateIndexes(relMap, newtup);
@@ -1943,15 +1867,15 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 			for (j = 0; j < ndict; j++)
 			{
 				Datum		values[Natts_pg_ts_config_map];
-				bool		nulls[Natts_pg_ts_config_map];
+				char		nulls[Natts_pg_ts_config_map];
 
-				memset(nulls, false, sizeof(nulls));
+				memset(nulls, ' ', sizeof(nulls));
 				values[Anum_pg_ts_config_map_mapcfg - 1] = ObjectIdGetDatum(cfgId);
 				values[Anum_pg_ts_config_map_maptokentype - 1] = Int32GetDatum(tokens[i]);
 				values[Anum_pg_ts_config_map_mapseqno - 1] = Int32GetDatum(j + 1);
 				values[Anum_pg_ts_config_map_mapdict - 1] = ObjectIdGetDatum(dictIds[j]);
 
-				tup = heap_form_tuple(relMap->rd_att, values, nulls);
+				tup = heap_formtuple(relMap->rd_att, values, nulls);
 				simple_heap_insert(relMap, tup);
 				CatalogUpdateIndexes(relMap, tup);
 
@@ -2075,7 +1999,7 @@ serialize_deflist(List *deflist)
 			appendStringInfo(&buf, ", ");
 	}
 
-	result = cstring_to_text_with_len(buf.data, buf.len);
+	result = CStringGetTextP(buf.data);
 	pfree(buf.data);
 	return result;
 }
@@ -2175,7 +2099,7 @@ deserialize_deflist(Datum txt)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("invalid parameter list format: \"%s\"",
-									text_to_cstring(in))));
+									TextPGetCString(in))));
 				break;
 			case CS_WAITVALUE:
 				if (*ptr == '\'')
@@ -2286,7 +2210,7 @@ deserialize_deflist(Datum txt)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("invalid parameter list format: \"%s\"",
-						text_to_cstring(in))));
+						TextPGetCString(in))));
 
 	pfree(workspace);
 

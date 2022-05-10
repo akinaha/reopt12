@@ -3,18 +3,17 @@
  * twophase_rmgr.c
  *	  Two-phase-commit resource managers tables
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/transam/twophase_rmgr.c,v 1.8.2.1 2009/11/23 09:58:51 heikki Exp $
+ *	  $PostgreSQL: pgsql/src/backend/access/transam/twophase_rmgr.c,v 1.7 2008/01/01 19:45:48 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "access/multixact.h"
 #include "access/twophase_rmgr.h"
 #include "commands/async.h"
 #include "pgstat.h"
@@ -30,8 +29,7 @@ const TwoPhaseCallback twophase_recover_callbacks[TWOPHASE_RM_MAX_ID + 1] =
 	NULL,						/* Inval */
 	NULL,						/* flat file update */
 	NULL,						/* notify/listen */
-	NULL,						/* pgstat */
-	multixact_twophase_recover	/* MultiXact */
+	NULL						/* pgstat */
 };
 
 const TwoPhaseCallback twophase_postcommit_callbacks[TWOPHASE_RM_MAX_ID + 1] =
@@ -41,8 +39,7 @@ const TwoPhaseCallback twophase_postcommit_callbacks[TWOPHASE_RM_MAX_ID + 1] =
 	inval_twophase_postcommit,	/* Inval */
 	flatfile_twophase_postcommit,		/* flat file update */
 	notify_twophase_postcommit, /* notify/listen */
-	pgstat_twophase_postcommit,	/* pgstat */
-	multixact_twophase_postcommit /* MultiXact */
+	pgstat_twophase_postcommit	/* pgstat */
 };
 
 const TwoPhaseCallback twophase_postabort_callbacks[TWOPHASE_RM_MAX_ID + 1] =
@@ -52,6 +49,5 @@ const TwoPhaseCallback twophase_postabort_callbacks[TWOPHASE_RM_MAX_ID + 1] =
 	NULL,						/* Inval */
 	NULL,						/* flat file update */
 	NULL,						/* notify/listen */
-	pgstat_twophase_postabort,	/* pgstat */
-	multixact_twophase_postabort /* MultiXact */
+	pgstat_twophase_postabort	/* pgstat */
 };

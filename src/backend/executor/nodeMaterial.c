@@ -3,12 +3,12 @@
  * nodeMaterial.c
  *	  Routines to handle materialization nodes.
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeMaterial.c,v 1.69 2009/06/11 14:48:57 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/executor/nodeMaterial.c,v 1.61 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -51,7 +51,7 @@ ExecMaterial(MaterialState *node)
 	estate = node->ss.ps.state;
 	dir = estate->es_direction;
 	forward = ScanDirectionIsForward(dir);
-	tuplestorestate = node->tuplestorestate;
+	tuplestorestate = (Tuplestorestate *) node->tuplestorestate;
 
 	/*
 	 * If first time through, and we need a tuplestore, initialize it.
@@ -60,19 +60,7 @@ ExecMaterial(MaterialState *node)
 	{
 		tuplestorestate = tuplestore_begin_heap(true, false, work_mem);
 		tuplestore_set_eflags(tuplestorestate, node->eflags);
-		if (node->eflags & EXEC_FLAG_MARK)
-		{
-			/*
-			 * Allocate a second read pointer to serve as the mark. We know it
-			 * must have index 1, so needn't store that.
-			 */
-			int			ptrno;
-
-			ptrno = tuplestore_alloc_read_pointer(tuplestorestate,
-												  node->eflags);
-			Assert(ptrno == 1);
-		}
-		node->tuplestorestate = tuplestorestate;
+		node->tuplestorestate = (void *) tuplestorestate;
 	}
 
 	/*
@@ -104,7 +92,7 @@ ExecMaterial(MaterialState *node)
 	slot = node->ss.ps.ps_ResultTupleSlot;
 	if (!eof_tuplestore)
 	{
-		if (tuplestore_gettupleslot(tuplestorestate, forward, false, slot))
+		if (tuplestore_gettupleslot(tuplestorestate, forward, slot))
 			return slot;
 		if (forward)
 			eof_tuplestore = true;
@@ -136,17 +124,18 @@ ExecMaterial(MaterialState *node)
 		}
 
 		/*
-		 * Append a copy of the returned tuple to tuplestore.  NOTE: because
-		 * the tuplestore is certainly in EOF state, its read position will
-		 * move forward over the added tuple.  This is what we want.
+		 * Append returned tuple to tuplestore.  NOTE: because the tuplestore
+		 * is certainly in EOF state, its read position will move forward over
+		 * the added tuple.  This is what we want.
 		 */
 		if (tuplestorestate)
 			tuplestore_puttupleslot(tuplestorestate, outerslot);
 
 		/*
-		 * We can just return the subplan's returned tuple, without copying.
+		 * And return a copy of the tuple.	(XXX couldn't we just return the
+		 * outerslot?)
 		 */
-		return outerslot;
+		return ExecCopySlot(slot, outerslot);
 	}
 
 	/*
@@ -181,16 +170,6 @@ ExecInitMaterial(Material *node, EState *estate, int eflags)
 	matstate->eflags = (eflags & (EXEC_FLAG_REWIND |
 								  EXEC_FLAG_BACKWARD |
 								  EXEC_FLAG_MARK));
-
-	/*
-	 * Tuplestore's interpretation of the flag bits is subtly different from
-	 * the general executor meaning: it doesn't think BACKWARD necessarily
-	 * means "backwards all the way to start".	If told to support BACKWARD we
-	 * must include REWIND in the tuplestore eflags, else tuplestore_trim
-	 * might throw away too much.
-	 */
-	if (eflags & EXEC_FLAG_BACKWARD)
-		matstate->eflags |= EXEC_FLAG_REWIND;
 
 	matstate->eof_underlying = false;
 	matstate->tuplestorestate = NULL;
@@ -258,7 +237,7 @@ ExecEndMaterial(MaterialState *node)
 	 * Release tuplestore resources
 	 */
 	if (node->tuplestorestate != NULL)
-		tuplestore_end(node->tuplestorestate);
+		tuplestore_end((Tuplestorestate *) node->tuplestorestate);
 	node->tuplestorestate = NULL;
 
 	/*
@@ -284,15 +263,7 @@ ExecMaterialMarkPos(MaterialState *node)
 	if (!node->tuplestorestate)
 		return;
 
-	/*
-	 * copy the active read pointer to the mark.
-	 */
-	tuplestore_copy_read_pointer(node->tuplestorestate, 0, 1);
-
-	/*
-	 * since we may have advanced the mark, try to truncate the tuplestore.
-	 */
-	tuplestore_trim(node->tuplestorestate);
+	tuplestore_markpos((Tuplestorestate *) node->tuplestorestate);
 }
 
 /* ----------------------------------------------------------------
@@ -313,9 +284,9 @@ ExecMaterialRestrPos(MaterialState *node)
 		return;
 
 	/*
-	 * copy the mark to the active read pointer.
+	 * restore the scan to the previously marked position
 	 */
-	tuplestore_copy_read_pointer(node->tuplestorestate, 1, 0);
+	tuplestore_restorepos((Tuplestorestate *) node->tuplestorestate);
 }
 
 /* ----------------------------------------------------------------
@@ -352,14 +323,14 @@ ExecMaterialReScan(MaterialState *node, ExprContext *exprCtxt)
 		if (((PlanState *) node)->lefttree->chgParam != NULL ||
 			(node->eflags & EXEC_FLAG_REWIND) == 0)
 		{
-			tuplestore_end(node->tuplestorestate);
+			tuplestore_end((Tuplestorestate *) node->tuplestorestate);
 			node->tuplestorestate = NULL;
 			if (((PlanState *) node)->lefttree->chgParam == NULL)
 				ExecReScan(((PlanState *) node)->lefttree, exprCtxt);
 			node->eof_underlying = false;
 		}
 		else
-			tuplestore_rescan(node->tuplestorestate);
+			tuplestore_rescan((Tuplestorestate *) node->tuplestorestate);
 	}
 	else
 	{

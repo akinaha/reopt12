@@ -3,12 +3,12 @@
  * nodeNestloop.c
  *	  routines to support nest-loop joins
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeNestloop.c,v 1.53 2009/06/11 14:48:57 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/executor/nodeNestloop.c,v 1.46 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -79,6 +79,12 @@ ExecNestLoop(NestLoopState *node)
 	econtext = node->js.ps.ps_ExprContext;
 
 	/*
+	 * get the current outer tuple
+	 */
+	outerTupleSlot = node->js.ps.ps_OuterTupleSlot;
+	econtext->ecxt_outertuple = outerTupleSlot;
+
+	/*
 	 * Check to see if we're still projecting out tuples from a previous join
 	 * tuple (because there is a function-returning-set in the projection
 	 * expressions).  If so, try to project another one.
@@ -94,6 +100,15 @@ ExecNestLoop(NestLoopState *node)
 		/* Done with that source tuple... */
 		node->js.ps.ps_TupFromTlist = false;
 	}
+
+	/*
+	 * If we're doing an IN join, we want to return at most one row per outer
+	 * tuple; so we can stop scanning the inner scan if we matched on the
+	 * previous try.
+	 */
+	if (node->js.jointype == JOIN_IN &&
+		node->nl_MatchedOuter)
+		node->nl_NeedNewOuter = true;
 
 	/*
 	 * Reset per-tuple memory context to free any expression evaluation
@@ -129,6 +144,7 @@ ExecNestLoop(NestLoopState *node)
 			}
 
 			ENL1_printf("saving new outer tuple information");
+			node->js.ps.ps_OuterTupleSlot = outerTupleSlot;
 			econtext->ecxt_outertuple = outerTupleSlot;
 			node->nl_NeedNewOuter = false;
 			node->nl_MatchedOuter = false;
@@ -161,8 +177,7 @@ ExecNestLoop(NestLoopState *node)
 			node->nl_NeedNewOuter = true;
 
 			if (!node->nl_MatchedOuter &&
-				(node->js.jointype == JOIN_LEFT ||
-				 node->js.jointype == JOIN_ANTI))
+				node->js.jointype == JOIN_LEFT)
 			{
 				/*
 				 * We are doing an outer join and there were no join matches
@@ -174,7 +189,7 @@ ExecNestLoop(NestLoopState *node)
 
 				ENL1_printf("testing qualification for outer-join tuple");
 
-				if (otherqual == NIL || ExecQual(otherqual, econtext, false))
+				if (ExecQual(otherqual, econtext, false))
 				{
 					/*
 					 * qualification was satisfied so we project and return
@@ -217,20 +232,6 @@ ExecNestLoop(NestLoopState *node)
 		{
 			node->nl_MatchedOuter = true;
 
-			/* In an antijoin, we never return a matched tuple */
-			if (node->js.jointype == JOIN_ANTI)
-			{
-				node->nl_NeedNewOuter = true;
-				continue;		/* return to top of loop */
-			}
-
-			/*
-			 * In a semijoin, we'll consider returning the first match, but
-			 * after that we're done with this outer tuple.
-			 */
-			if (node->js.jointype == JOIN_SEMI)
-				node->nl_NeedNewOuter = true;
-
 			if (otherqual == NIL || ExecQual(otherqual, econtext, false))
 			{
 				/*
@@ -251,6 +252,10 @@ ExecNestLoop(NestLoopState *node)
 					return result;
 				}
 			}
+
+			/* If we didn't return a tuple, may need to set NeedNewOuter */
+			if (node->js.jointype == JOIN_IN)
+				node->nl_NeedNewOuter = true;
 		}
 
 		/*
@@ -328,10 +333,9 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	switch (node->join.jointype)
 	{
 		case JOIN_INNER:
-		case JOIN_SEMI:
+		case JOIN_IN:
 			break;
 		case JOIN_LEFT:
-		case JOIN_ANTI:
 			nlstate->nl_NullInnerTupleSlot =
 				ExecInitNullTupleSlot(estate,
 								 ExecGetResultType(innerPlanState(nlstate)));
@@ -350,6 +354,7 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	/*
 	 * finally, wipe the current outer tuple clean.
 	 */
+	nlstate->js.ps.ps_OuterTupleSlot = NULL;
 	nlstate->js.ps.ps_TupFromTlist = false;
 	nlstate->nl_NeedNewOuter = true;
 	nlstate->nl_MatchedOuter = false;
@@ -418,6 +423,8 @@ ExecReScanNestLoop(NestLoopState *node, ExprContext *exprCtxt)
 	if (outerPlan->chgParam == NULL)
 		ExecReScan(outerPlan, exprCtxt);
 
+	/* let outerPlan to free its result tuple ... */
+	node->js.ps.ps_OuterTupleSlot = NULL;
 	node->js.ps.ps_TupFromTlist = false;
 	node->nl_NeedNewOuter = true;
 	node->nl_MatchedOuter = false;

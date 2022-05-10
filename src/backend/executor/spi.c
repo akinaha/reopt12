@@ -3,33 +3,23 @@
  * spi.c
  *				Server Programming Interface
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/spi.c,v 1.208.2.1 2009/10/02 17:58:21 alvherre Exp $
+ *	  $PostgreSQL: pgsql/src/backend/executor/spi.c,v 1.187 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
 #include "access/printtup.h"
-#include "access/sysattr.h"
-#include "access/xact.h"
 #include "catalog/heap.h"
-#include "catalog/pg_type.h"
 #include "commands/trigger.h"
-#include "executor/executor.h"
 #include "executor/spi_priv.h"
-#include "tcop/pquery.h"
-#include "tcop/utility.h"
-#include "utils/builtins.h"
-#include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "utils/snapmgr.h"
-#include "utils/syscache.h"
 #include "utils/typcache.h"
 
 
@@ -44,20 +34,12 @@ static int	_SPI_stack_depth = 0;		/* allocated size of _SPI_stack */
 static int	_SPI_connected = -1;
 static int	_SPI_curid = -1;
 
-static Portal SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
-						 Datum *Values, const char *Nulls,
-						 bool read_only, int pflags);
+static void _SPI_prepare_plan(const char *src, SPIPlanPtr plan);
 
-static void _SPI_prepare_plan(const char *src, SPIPlanPtr plan,
-				  ParamListInfo boundParams);
-
-static int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
+static int _SPI_execute_plan(SPIPlanPtr plan,
+				  Datum *Values, const char *Nulls,
 				  Snapshot snapshot, Snapshot crosscheck_snapshot,
 				  bool read_only, bool fire_triggers, long tcount);
-
-static ParamListInfo _SPI_convert_params(int nargs, Oid *argtypes,
-					Datum *Values, const char *Nulls,
-					int pflags);
 
 static int	_SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, long tcount);
 
@@ -304,31 +286,6 @@ SPI_pop(void)
 	_SPI_curid--;
 }
 
-/* Conditional push: push only if we're inside a SPI procedure */
-bool
-SPI_push_conditional(void)
-{
-	bool		pushed = (_SPI_curid != _SPI_connected);
-
-	if (pushed)
-	{
-		_SPI_curid++;
-		/* We should now be in a state where SPI_connect would succeed */
-		Assert(_SPI_curid == _SPI_connected);
-	}
-	return pushed;
-}
-
-/* Conditional pop: pop only if SPI_push_conditional pushed */
-void
-SPI_pop_conditional(bool pushed)
-{
-	/* We should be in a state where SPI_connect would succeed */
-	Assert(_SPI_curid == _SPI_connected);
-	if (pushed)
-		_SPI_curid--;
-}
-
 /* Restore state of SPI stack after aborting a subtransaction */
 void
 SPI_restore_connection(void)
@@ -355,9 +312,9 @@ SPI_execute(const char *src, bool read_only, long tcount)
 	plan.magic = _SPI_PLAN_MAGIC;
 	plan.cursor_options = 0;
 
-	_SPI_prepare_plan(src, &plan, NULL);
+	_SPI_prepare_plan(src, &plan);
 
-	res = _SPI_execute_plan(&plan, NULL,
+	res = _SPI_execute_plan(&plan, NULL, NULL,
 							InvalidSnapshot, InvalidSnapshot,
 							read_only, true, tcount);
 
@@ -390,9 +347,7 @@ SPI_execute_plan(SPIPlanPtr plan, Datum *Values, const char *Nulls,
 		return res;
 
 	res = _SPI_execute_plan(plan,
-							_SPI_convert_params(plan->nargs, plan->argtypes,
-												Values, Nulls,
-												0),
+							Values, Nulls,
 							InvalidSnapshot, InvalidSnapshot,
 							read_only, true, tcount);
 
@@ -409,10 +364,9 @@ SPI_execp(SPIPlanPtr plan, Datum *Values, const char *Nulls, long tcount)
 
 /*
  * SPI_execute_snapshot -- identical to SPI_execute_plan, except that we allow
- * the caller to specify exactly which snapshots to use, which will be
- * registered here.  Also, the caller may specify that AFTER triggers should be
- * queued as part of the outer query rather than being fired immediately at the
- * end of the command.
+ * the caller to specify exactly which snapshots to use.  Also, the caller
+ * may specify that AFTER triggers should be queued as part of the outer
+ * query rather than being fired immediately at the end of the command.
  *
  * This is currently not documented in spi.sgml because it is only intended
  * for use by RI triggers.
@@ -439,62 +393,9 @@ SPI_execute_snapshot(SPIPlanPtr plan,
 		return res;
 
 	res = _SPI_execute_plan(plan,
-							_SPI_convert_params(plan->nargs, plan->argtypes,
-												Values, Nulls,
-												0),
+							Values, Nulls,
 							snapshot, crosscheck_snapshot,
 							read_only, fire_triggers, tcount);
-
-	_SPI_end_call(true);
-	return res;
-}
-
-/*
- * SPI_execute_with_args -- plan and execute a query with supplied arguments
- *
- * This is functionally comparable to SPI_prepare followed by
- * SPI_execute_plan, except that since we know the plan will be used only
- * once, we can tell the planner to rely on the parameter values as constants.
- * This eliminates potential performance disadvantages compared to
- * inserting the parameter values directly into the query text.
- */
-int
-SPI_execute_with_args(const char *src,
-					  int nargs, Oid *argtypes,
-					  Datum *Values, const char *Nulls,
-					  bool read_only, long tcount)
-{
-	int			res;
-	_SPI_plan	plan;
-	ParamListInfo paramLI;
-
-	if (src == NULL || nargs < 0 || tcount < 0)
-		return SPI_ERROR_ARGUMENT;
-
-	if (nargs > 0 && (argtypes == NULL || Values == NULL))
-		return SPI_ERROR_PARAM;
-
-	res = _SPI_begin_call(true);
-	if (res < 0)
-		return res;
-
-	memset(&plan, 0, sizeof(_SPI_plan));
-	plan.magic = _SPI_PLAN_MAGIC;
-	plan.cursor_options = 0;
-	plan.nargs = nargs;
-	plan.argtypes = argtypes;
-
-	paramLI = _SPI_convert_params(nargs, argtypes,
-								  Values, Nulls,
-								  PARAM_FLAG_CONST);
-
-	_SPI_prepare_plan(src, &plan, paramLI);
-
-	/* We don't need to copy the plan since it will be thrown away anyway */
-
-	res = _SPI_execute_plan(&plan, paramLI,
-							InvalidSnapshot, InvalidSnapshot,
-							read_only, true, tcount);
 
 	_SPI_end_call(true);
 	return res;
@@ -529,7 +430,7 @@ SPI_prepare_cursor(const char *src, int nargs, Oid *argtypes,
 	plan.nargs = nargs;
 	plan.argtypes = argtypes;
 
-	_SPI_prepare_plan(src, &plan, NULL);
+	_SPI_prepare_plan(src, &plan);
 
 	/* copy plan to procedure context */
 	result = _SPI_copy_plan(&plan, _SPI_current->procCxt);
@@ -660,7 +561,7 @@ SPI_modifytuple(Relation rel, HeapTuple tuple, int natts, int *attnum,
 	HeapTuple	mtuple;
 	int			numberOfAttributes;
 	Datum	   *v;
-	bool	   *n;
+	char	   *n;
 	int			i;
 
 	if (rel == NULL || tuple == NULL || natts < 0 || attnum == NULL || Values == NULL)
@@ -678,10 +579,10 @@ SPI_modifytuple(Relation rel, HeapTuple tuple, int natts, int *attnum,
 	SPI_result = 0;
 	numberOfAttributes = rel->rd_att->natts;
 	v = (Datum *) palloc(numberOfAttributes * sizeof(Datum));
-	n = (bool *) palloc(numberOfAttributes * sizeof(bool));
+	n = (char *) palloc(numberOfAttributes * sizeof(char));
 
 	/* fetch old values and nulls */
-	heap_deform_tuple(tuple, rel->rd_att, v, n);
+	heap_deformtuple(tuple, rel->rd_att, v, n);
 
 	/* replace values and nulls */
 	for (i = 0; i < natts; i++)
@@ -689,12 +590,12 @@ SPI_modifytuple(Relation rel, HeapTuple tuple, int natts, int *attnum,
 		if (attnum[i] <= 0 || attnum[i] > numberOfAttributes)
 			break;
 		v[attnum[i] - 1] = Values[i];
-		n[attnum[i] - 1] = (Nulls && Nulls[i] == 'n') ? true : false;
+		n[attnum[i] - 1] = (Nulls && Nulls[i] == 'n') ? 'n' : ' ';
 	}
 
 	if (i == natts)				/* no errors in *attnum */
 	{
-		mtuple = heap_form_tuple(rel->rd_att, v, n);
+		mtuple = heap_formtuple(rel->rd_att, v, n);
 
 		/*
 		 * copy the identification info of the old tuple: t_ctid, t_self, and
@@ -776,7 +677,7 @@ SPI_getvalue(HeapTuple tuple, TupleDesc tupdesc, int fnumber)
 
 	SPI_result = 0;
 
-	if (fnumber > tupdesc->natts || fnumber == 0 ||
+	if (fnumber > HeapTupleHeaderGetNatts(tuple->t_data) || fnumber == 0 ||
 		fnumber <= FirstLowInvalidHeapAttributeNumber)
 	{
 		SPI_result = SPI_ERROR_NOATTRIBUTE;
@@ -817,7 +718,7 @@ SPI_getbinval(HeapTuple tuple, TupleDesc tupdesc, int fnumber, bool *isnull)
 {
 	SPI_result = 0;
 
-	if (fnumber > tupdesc->natts || fnumber == 0 ||
+	if (fnumber > HeapTupleHeaderGetNatts(tuple->t_data) || fnumber == 0 ||
 		fnumber <= FirstLowInvalidHeapAttributeNumber)
 	{
 		SPI_result = SPI_ERROR_NOATTRIBUTE;
@@ -954,84 +855,9 @@ SPI_cursor_open(const char *name, SPIPlanPtr plan,
 				Datum *Values, const char *Nulls,
 				bool read_only)
 {
-	return SPI_cursor_open_internal(name, plan, Values, Nulls,
-									read_only, 0);
-}
-
-
-/*
- * SPI_cursor_open_with_args()
- *
- * Parse and plan a query and open it as a portal.	Like SPI_execute_with_args,
- * we can tell the planner to rely on the parameter values as constants,
- * because the plan will only be used once.
- */
-Portal
-SPI_cursor_open_with_args(const char *name,
-						  const char *src,
-						  int nargs, Oid *argtypes,
-						  Datum *Values, const char *Nulls,
-						  bool read_only, int cursorOptions)
-{
-	Portal		result;
-	_SPI_plan	plan;
-	ParamListInfo paramLI;
-
-	if (src == NULL || nargs < 0)
-		elog(ERROR, "SPI_cursor_open_with_args called with invalid arguments");
-
-	if (nargs > 0 && (argtypes == NULL || Values == NULL))
-		elog(ERROR, "SPI_cursor_open_with_args called with missing parameters");
-
-	SPI_result = _SPI_begin_call(true);
-	if (SPI_result < 0)
-		elog(ERROR, "SPI_cursor_open_with_args called while not connected");
-
-	memset(&plan, 0, sizeof(_SPI_plan));
-	plan.magic = _SPI_PLAN_MAGIC;
-	plan.cursor_options = cursorOptions;
-	plan.nargs = nargs;
-	plan.argtypes = argtypes;
-
-	paramLI = _SPI_convert_params(nargs, argtypes,
-								  Values, Nulls,
-								  PARAM_FLAG_CONST);
-
-	_SPI_prepare_plan(src, &plan, paramLI);
-
-	/* We needn't copy the plan; SPI_cursor_open_internal will do so */
-
-	/* Adjust stack so that SPI_cursor_open_internal doesn't complain */
-	_SPI_curid--;
-
-	/* SPI_cursor_open_internal must be called in procedure memory context */
-	_SPI_procmem();
-
-	result = SPI_cursor_open_internal(name, &plan, Values, Nulls,
-									  read_only, PARAM_FLAG_CONST);
-
-	/* And clean up */
-	_SPI_curid++;
-	_SPI_end_call(true);
-
-	return result;
-}
-
-
-/*
- * SPI_cursor_open_internal()
- *
- *	Common code for SPI_cursor_open and SPI_cursor_open_with_args
- */
-static Portal
-SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
-						 Datum *Values, const char *Nulls,
-						 bool read_only, int pflags)
-{
 	CachedPlanSource *plansource;
 	CachedPlan *cplan;
 	List	   *stmt_list;
-	char	   *query_string;
 	ParamListInfo paramLI;
 	Snapshot	snapshot;
 	MemoryContext oldcontext;
@@ -1060,10 +886,6 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 	Assert(list_length(plan->plancache_list) == 1);
 	plansource = (CachedPlanSource *) linitial(plan->plancache_list);
 
-	/* Push the SPI stack */
-	if (_SPI_begin_call(false) < 0)
-		elog(ERROR, "SPI_cursor_open called while not connected");
-
 	/* Reset SPI result (note we deliberately don't touch lastoid) */
 	SPI_processed = 0;
 	SPI_tuptable = NULL;
@@ -1082,20 +904,10 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 		portal = CreatePortal(name, false, false);
 	}
 
-	/*
-	 * Prepare to copy stuff into the portal's memory context.  We do all this
-	 * copying first, because it could possibly fail (out-of-memory) and we
-	 * don't want a failure to occur between RevalidateCachedPlan and
-	 * PortalDefineQuery; that would result in leaking our plancache refcount.
-	 */
-	oldcontext = MemoryContextSwitchTo(PortalGetHeapMemory(portal));
-
-	/* Copy the plan's query string into the portal */
-	query_string = pstrdup(plansource->query_string);
-
 	/* If the plan has parameters, copy them into the portal */
 	if (plan->nargs > 0)
 	{
+		oldcontext = MemoryContextSwitchTo(PortalGetHeapMemory(portal));
 		/* sizeof(ParamListInfoData) includes the first array element */
 		paramLI = (ParamListInfo) palloc(sizeof(ParamListInfoData) +
 								 (plan->nargs - 1) *sizeof(ParamExternData));
@@ -1106,7 +918,7 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 			ParamExternData *prm = &paramLI->params[k];
 
 			prm->ptype = plan->argtypes[k];
-			prm->pflags = pflags;
+			prm->pflags = 0;
 			prm->isnull = (Nulls && Nulls[k] == 'n');
 			if (prm->isnull)
 			{
@@ -1124,11 +936,10 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 									   paramTypByVal, paramTypLen);
 			}
 		}
+		MemoryContextSwitchTo(oldcontext);
 	}
 	else
 		paramLI = NULL;
-
-	MemoryContextSwitchTo(oldcontext);
 
 	if (plan->saved)
 	{
@@ -1150,7 +961,7 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 	 */
 	PortalDefineQuery(portal,
 					  NULL,		/* no statement name */
-					  query_string,
+					  plansource->query_string,
 					  plansource->commandTag,
 					  stmt_list,
 					  cplan);
@@ -1211,9 +1022,12 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 		}
 	}
 
-	/* Set up the snapshot to use. */
+	/*
+	 * Set up the snapshot to use.	(PortalStart will do CopySnapshot, so we
+	 * skip that here.)
+	 */
 	if (read_only)
-		snapshot = GetActiveSnapshot();
+		snapshot = ActiveSnapshot;
 	else
 	{
 		CommandCounterIncrement();
@@ -1226,9 +1040,6 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 	PortalStart(portal, paramLI, snapshot);
 
 	Assert(portal->strategy != PORTAL_MULTI_QUERY);
-
-	/* Pop the SPI stack */
-	_SPI_end_call(false);
 
 	/* Return the created portal */
 	return portal;
@@ -1257,7 +1068,7 @@ SPI_cursor_fetch(Portal portal, bool forward, long count)
 {
 	_SPI_cursor_operation(portal,
 						  forward ? FETCH_FORWARD : FETCH_BACKWARD, count,
-						  CreateDestReceiver(DestSPI));
+						  CreateDestReceiver(DestSPI, NULL));
 	/* we know that the DestSPI receiver doesn't need a destroy call */
 }
 
@@ -1286,7 +1097,7 @@ SPI_scroll_cursor_fetch(Portal portal, FetchDirection direction, long count)
 {
 	_SPI_cursor_operation(portal,
 						  direction, count,
-						  CreateDestReceiver(DestSPI));
+						  CreateDestReceiver(DestSPI, NULL));
 	/* we know that the DestSPI receiver doesn't need a destroy call */
 }
 
@@ -1369,16 +1180,8 @@ SPI_is_cursor_plan(SPIPlanPtr plan)
 	}
 
 	if (list_length(plan->plancache_list) != 1)
-	{
-		SPI_result = 0;
 		return false;			/* not exactly 1 pre-rewrite command */
-	}
 	plansource = (CachedPlanSource *) linitial(plan->plancache_list);
-
-	/* Need _SPI_begin_call in case replanning invokes SPI-using functions */
-	SPI_result = _SPI_begin_call(false);
-	if (SPI_result < 0)
-		return false;
 
 	if (plan->saved)
 	{
@@ -1387,44 +1190,11 @@ SPI_is_cursor_plan(SPIPlanPtr plan)
 		ReleaseCachedPlan(cplan, true);
 	}
 
-	_SPI_end_call(false);
-	SPI_result = 0;
-
 	/* Does it return tuples? */
 	if (plansource->resultDesc)
 		return true;
 
 	return false;
-}
-
-/*
- * SPI_plan_is_valid --- test whether a SPI plan is currently valid
- * (that is, not marked as being in need of revalidation).
- *
- * See notes for CachedPlanIsValid before using this.
- */
-bool
-SPI_plan_is_valid(SPIPlanPtr plan)
-{
-	Assert(plan->magic == _SPI_PLAN_MAGIC);
-	if (plan->saved)
-	{
-		ListCell   *lc;
-
-		foreach(lc, plan->plancache_list)
-		{
-			CachedPlanSource *plansource = (CachedPlanSource *) lfirst(lc);
-
-			if (!CachedPlanIsValid(plansource))
-				return false;
-		}
-		return true;
-	}
-	else
-	{
-		/* An unsaved plan is assumed valid for its (short) lifetime */
-		return true;
-	}
 }
 
 /*
@@ -1487,8 +1257,6 @@ SPI_result_code_string(int code)
 			return "SPI_OK_DELETE_RETURNING";
 		case SPI_OK_UPDATE_RETURNING:
 			return "SPI_OK_UPDATE_RETURNING";
-		case SPI_OK_REWRITTEN:
-			return "SPI_OK_REWRITTEN";
 	}
 	/* Unrecognized code ... return something useful ... */
 	sprintf(buf, "Unrecognized SPI code %d", code);
@@ -1589,17 +1357,14 @@ spi_printtup(TupleTableSlot *slot, DestReceiver *self)
  * Parse and plan a querystring.
  *
  * At entry, plan->argtypes, plan->nargs, and plan->cursor_options must be
- * valid.  If boundParams isn't NULL then it represents parameter values
- * that are made available to the planner (as either estimates or hard values
- * depending on their PARAM_FLAG_CONST marking).  The boundParams had better
- * match the param types embedded in the plan!
+ * valid.
  *
  * Results are stored into *plan (specifically, plan->plancache_list).
  * Note however that the result trees are all in CurrentMemoryContext
  * and need to be copied somewhere to survive.
  */
 static void
-_SPI_prepare_plan(const char *src, SPIPlanPtr plan, ParamListInfo boundParams)
+_SPI_prepare_plan(const char *src, SPIPlanPtr plan)
 {
 	List	   *raw_parsetree_list;
 	List	   *plancache_list;
@@ -1638,7 +1403,7 @@ _SPI_prepare_plan(const char *src, SPIPlanPtr plan, ParamListInfo boundParams)
 		/* Need a copyObject here to keep parser from modifying raw tree */
 		stmt_list = pg_analyze_and_rewrite(copyObject(parsetree),
 										   src, argtypes, nargs);
-		stmt_list = pg_plan_queries(stmt_list, cursor_options, boundParams);
+		stmt_list = pg_plan_queries(stmt_list, cursor_options, NULL, false);
 
 		plansource = (CachedPlanSource *) palloc0(sizeof(CachedPlanSource));
 		cplan = (CachedPlan *) palloc0(sizeof(CachedPlan));
@@ -1681,225 +1446,244 @@ _SPI_prepare_plan(const char *src, SPIPlanPtr plan, ParamListInfo boundParams)
  * tcount: execution tuple-count limit, or 0 for none
  */
 static int
-_SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
+_SPI_execute_plan(SPIPlanPtr plan, Datum *Values, const char *Nulls,
 				  Snapshot snapshot, Snapshot crosscheck_snapshot,
 				  bool read_only, bool fire_triggers, long tcount)
 {
-	int			my_res = 0;
-	uint32		my_processed = 0;
-	Oid			my_lastoid = InvalidOid;
-	SPITupleTable *my_tuptable = NULL;
-	int			res = 0;
-	bool		have_active_snap = ActiveSnapshotSet();
-	ErrorContextCallback spierrcontext;
-	CachedPlan *cplan = NULL;
-	ListCell   *lc1;
+	volatile int my_res = 0;
+	volatile uint32 my_processed = 0;
+	volatile Oid my_lastoid = InvalidOid;
+	SPITupleTable *volatile my_tuptable = NULL;
+	volatile int res = 0;
+	Snapshot	saveActiveSnapshot;
 
-	/*
-	 * Setup error traceback support for ereport()
-	 */
-	spierrcontext.callback = _SPI_error_callback;
-	spierrcontext.arg = NULL;
-	spierrcontext.previous = error_context_stack;
-	error_context_stack = &spierrcontext;
-
-	foreach(lc1, plan->plancache_list)
+	/* Be sure to restore ActiveSnapshot on error exit */
+	saveActiveSnapshot = ActiveSnapshot;
+	PG_TRY();
 	{
-		CachedPlanSource *plansource = (CachedPlanSource *) lfirst(lc1);
-		List	   *stmt_list;
-		ListCell   *lc2;
+		ListCell   *lc1;
+		ErrorContextCallback spierrcontext;
+		int			nargs = plan->nargs;
+		ParamListInfo paramLI;
+		CachedPlan *cplan = NULL;
 
-		spierrcontext.arg = (void *) plansource->query_string;
-
-		if (plan->saved)
+		/* Convert parameters to form wanted by executor */
+		if (nargs > 0)
 		{
-			/* Replan if needed, and increment plan refcount locally */
-			cplan = RevalidateCachedPlan(plansource, true);
-			stmt_list = cplan->stmt_list;
+			int			k;
+
+			/* sizeof(ParamListInfoData) includes the first array element */
+			paramLI = (ParamListInfo) palloc(sizeof(ParamListInfoData) +
+									   (nargs - 1) *sizeof(ParamExternData));
+			paramLI->numParams = nargs;
+
+			for (k = 0; k < nargs; k++)
+			{
+				ParamExternData *prm = &paramLI->params[k];
+
+				prm->value = Values[k];
+				prm->isnull = (Nulls && Nulls[k] == 'n');
+				prm->pflags = 0;
+				prm->ptype = plan->argtypes[k];
+			}
 		}
 		else
+			paramLI = NULL;
+
+		/*
+		 * Setup error traceback support for ereport()
+		 */
+		spierrcontext.callback = _SPI_error_callback;
+		spierrcontext.arg = NULL;
+		spierrcontext.previous = error_context_stack;
+		error_context_stack = &spierrcontext;
+
+		foreach(lc1, plan->plancache_list)
 		{
-			/* No replan here */
-			cplan = NULL;
-			stmt_list = plansource->plan->stmt_list;
-		}
+			CachedPlanSource *plansource = (CachedPlanSource *) lfirst(lc1);
+			List	   *stmt_list;
+			ListCell   *lc2;
 
-		foreach(lc2, stmt_list)
-		{
-			Node	   *stmt = (Node *) lfirst(lc2);
-			bool		canSetTag;
-			DestReceiver *dest;
-			bool		pushed_active_snap = false;
+			spierrcontext.arg = (void *) plansource->query_string;
 
-			_SPI_current->processed = 0;
-			_SPI_current->lastoid = InvalidOid;
-			_SPI_current->tuptable = NULL;
-
-			if (IsA(stmt, PlannedStmt))
+			if (plan->saved)
 			{
-				canSetTag = ((PlannedStmt *) stmt)->canSetTag;
+				/* Replan if needed, and increment plan refcount locally */
+				cplan = RevalidateCachedPlan(plansource, true);
+				stmt_list = cplan->stmt_list;
 			}
 			else
 			{
-				/* utilities are canSetTag if only thing in list */
-				canSetTag = (list_length(stmt_list) == 1);
+				/* No replan here */
+				cplan = NULL;
+				stmt_list = plansource->plan->stmt_list;
+			}
 
-				if (IsA(stmt, CopyStmt))
+			foreach(lc2, stmt_list)
+			{
+				Node	   *stmt = (Node *) lfirst(lc2);
+				bool		canSetTag;
+				QueryDesc  *qdesc;
+				DestReceiver *dest;
+
+				_SPI_current->processed = 0;
+				_SPI_current->lastoid = InvalidOid;
+				_SPI_current->tuptable = NULL;
+
+				if (IsA(stmt, PlannedStmt))
 				{
-					CopyStmt   *cstmt = (CopyStmt *) stmt;
+					canSetTag = ((PlannedStmt *) stmt)->canSetTag;
+				}
+				else
+				{
+					/* utilities are canSetTag if only thing in list */
+					canSetTag = (list_length(stmt_list) == 1);
 
-					if (cstmt->filename == NULL)
+					if (IsA(stmt, CopyStmt))
 					{
-						my_res = SPI_ERROR_COPY;
+						CopyStmt   *cstmt = (CopyStmt *) stmt;
+
+						if (cstmt->filename == NULL)
+						{
+							my_res = SPI_ERROR_COPY;
+							goto fail;
+						}
+					}
+					else if (IsA(stmt, TransactionStmt))
+					{
+						my_res = SPI_ERROR_TRANSACTION;
 						goto fail;
 					}
 				}
-				else if (IsA(stmt, TransactionStmt))
+
+				if (read_only && !CommandIsReadOnly(stmt))
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					/* translator: %s is a SQL statement name */
+					   errmsg("%s is not allowed in a non-volatile function",
+							  CreateCommandTag(stmt))));
+
+				/*
+				 * If not read-only mode, advance the command counter before
+				 * each command.
+				 */
+				if (!read_only)
+					CommandCounterIncrement();
+
+				dest = CreateDestReceiver(canSetTag ? DestSPI : DestNone,
+										  NULL);
+
+				if (snapshot == InvalidSnapshot)
 				{
-					my_res = SPI_ERROR_TRANSACTION;
+					/*
+					 * Default read_only behavior is to use the entry-time
+					 * ActiveSnapshot; if read-write, grab a full new snap.
+					 */
+					if (read_only)
+						ActiveSnapshot = CopySnapshot(saveActiveSnapshot);
+					else
+						ActiveSnapshot = CopySnapshot(GetTransactionSnapshot());
+				}
+				else
+				{
+					/*
+					 * We interpret read_only with a specified snapshot to be
+					 * exactly that snapshot, but read-write means use the
+					 * snap with advancing of command ID.
+					 */
+					ActiveSnapshot = CopySnapshot(snapshot);
+					if (!read_only)
+						ActiveSnapshot->curcid = GetCurrentCommandId(false);
+				}
+
+				if (IsA(stmt, PlannedStmt) &&
+					((PlannedStmt *) stmt)->utilityStmt == NULL)
+				{
+					qdesc = CreateQueryDesc((PlannedStmt *) stmt,
+											ActiveSnapshot,
+											crosscheck_snapshot,
+											dest,
+											paramLI, false);
+					res = _SPI_pquery(qdesc, fire_triggers,
+									  canSetTag ? tcount : 0);
+					FreeQueryDesc(qdesc);
+				}
+				else
+				{
+					ProcessUtility(stmt,
+								   plansource->query_string,
+								   paramLI,
+								   false,		/* not top level */
+								   dest,
+								   NULL);
+					/* Update "processed" if stmt returned tuples */
+					if (_SPI_current->tuptable)
+						_SPI_current->processed = _SPI_current->tuptable->alloced - _SPI_current->tuptable->free;
+					res = SPI_OK_UTILITY;
+				}
+				FreeSnapshot(ActiveSnapshot);
+				ActiveSnapshot = NULL;
+
+				/*
+				 * The last canSetTag query sets the status values returned to
+				 * the caller.	Be careful to free any tuptables not returned,
+				 * to avoid intratransaction memory leak.
+				 */
+				if (canSetTag)
+				{
+					my_processed = _SPI_current->processed;
+					my_lastoid = _SPI_current->lastoid;
+					SPI_freetuptable(my_tuptable);
+					my_tuptable = _SPI_current->tuptable;
+					my_res = res;
+				}
+				else
+				{
+					SPI_freetuptable(_SPI_current->tuptable);
+					_SPI_current->tuptable = NULL;
+				}
+				/* we know that the receiver doesn't need a destroy call */
+				if (res < 0)
+				{
+					my_res = res;
 					goto fail;
 				}
 			}
 
-			if (read_only && !CommandIsReadOnly(stmt))
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				/* translator: %s is a SQL statement name */
-					   errmsg("%s is not allowed in a non-volatile function",
-							  CreateCommandTag(stmt))));
+			/* Done with this plan, so release refcount */
+			if (cplan)
+				ReleaseCachedPlan(cplan, true);
+			cplan = NULL;
 
 			/*
-			 * If not read-only mode, advance the command counter before each
-			 * command.
+			 * If not read-only mode, advance the command counter after the
+			 * last command.  This ensures that its effects are visible, in
+			 * case it was DDL that would affect the next CachedPlanSource.
 			 */
 			if (!read_only)
 				CommandCounterIncrement();
-
-			dest = CreateDestReceiver(canSetTag ? DestSPI : DestNone);
-
-			if (snapshot == InvalidSnapshot)
-			{
-				/*
-				 * Default read_only behavior is to use the entry-time
-				 * ActiveSnapshot, if any; if read-write, grab a full new
-				 * snap.
-				 */
-				if (read_only)
-				{
-					if (have_active_snap)
-					{
-						PushActiveSnapshot(GetActiveSnapshot());
-						pushed_active_snap = true;
-					}
-				}
-				else
-				{
-					PushActiveSnapshot(GetTransactionSnapshot());
-					pushed_active_snap = true;
-				}
-			}
-			else
-			{
-				/*
-				 * We interpret read_only with a specified snapshot to be
-				 * exactly that snapshot, but read-write means use the snap
-				 * with advancing of command ID.
-				 */
-				if (read_only)
-					PushActiveSnapshot(snapshot);
-				else
-					PushUpdatedSnapshot(snapshot);
-				pushed_active_snap = true;
-			}
-
-			if (IsA(stmt, PlannedStmt) &&
-				((PlannedStmt *) stmt)->utilityStmt == NULL)
-			{
-				QueryDesc  *qdesc;
-				Snapshot	snap;
-
-				if (ActiveSnapshotSet())
-					snap = GetActiveSnapshot();
-				else
-					snap = InvalidSnapshot;
-
-				qdesc = CreateQueryDesc((PlannedStmt *) stmt,
-										plansource->query_string,
-										snap, crosscheck_snapshot,
-										dest,
-										paramLI, false);
-				res = _SPI_pquery(qdesc, fire_triggers,
-								  canSetTag ? tcount : 0);
-				FreeQueryDesc(qdesc);
-			}
-			else
-			{
-				ProcessUtility(stmt,
-							   plansource->query_string,
-							   paramLI,
-							   false,	/* not top level */
-							   dest,
-							   NULL);
-				/* Update "processed" if stmt returned tuples */
-				if (_SPI_current->tuptable)
-					_SPI_current->processed = _SPI_current->tuptable->alloced -
-						_SPI_current->tuptable->free;
-				res = SPI_OK_UTILITY;
-			}
-
-			if (pushed_active_snap)
-				PopActiveSnapshot();
-
-			/*
-			 * The last canSetTag query sets the status values returned to the
-			 * caller.	Be careful to free any tuptables not returned, to
-			 * avoid intratransaction memory leak.
-			 */
-			if (canSetTag)
-			{
-				my_processed = _SPI_current->processed;
-				my_lastoid = _SPI_current->lastoid;
-				SPI_freetuptable(my_tuptable);
-				my_tuptable = _SPI_current->tuptable;
-				my_res = res;
-			}
-			else
-			{
-				SPI_freetuptable(_SPI_current->tuptable);
-				_SPI_current->tuptable = NULL;
-			}
-			/* we know that the receiver doesn't need a destroy call */
-			if (res < 0)
-			{
-				my_res = res;
-				goto fail;
-			}
 		}
-
-		/* Done with this plan, so release refcount */
-		if (cplan)
-			ReleaseCachedPlan(cplan, true);
-		cplan = NULL;
-
-		/*
-		 * If not read-only mode, advance the command counter after the last
-		 * command.  This ensures that its effects are visible, in case it was
-		 * DDL that would affect the next CachedPlanSource.
-		 */
-		if (!read_only)
-			CommandCounterIncrement();
-	}
 
 fail:
 
-	/* We no longer need the cached plan refcount, if any */
-	if (cplan)
-		ReleaseCachedPlan(cplan, true);
+		/* We no longer need the cached plan refcount, if any */
+		if (cplan)
+			ReleaseCachedPlan(cplan, true);
 
-	/*
-	 * Pop the error context stack
-	 */
-	error_context_stack = spierrcontext.previous;
+		/*
+		 * Pop the error context stack
+		 */
+		error_context_stack = spierrcontext.previous;
+	}
+	PG_CATCH();
+	{
+		/* Restore global vars and propagate error */
+		ActiveSnapshot = saveActiveSnapshot;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	ActiveSnapshot = saveActiveSnapshot;
 
 	/* Save results for caller */
 	SPI_processed = my_processed;
@@ -1910,48 +1694,13 @@ fail:
 	_SPI_current->tuptable = NULL;
 
 	/*
-	 * If none of the queries had canSetTag, return SPI_OK_REWRITTEN. Prior to
-	 * 8.4, we used return the last query's result code, but not its auxiliary
-	 * results, but that's confusing.
+	 * If none of the queries had canSetTag, we return the last query's result
+	 * code, but not its auxiliary results (for backwards compatibility).
 	 */
 	if (my_res == 0)
-		my_res = SPI_OK_REWRITTEN;
+		my_res = res;
 
 	return my_res;
-}
-
-/*
- * Convert query parameters to form wanted by planner and executor
- */
-static ParamListInfo
-_SPI_convert_params(int nargs, Oid *argtypes,
-					Datum *Values, const char *Nulls,
-					int pflags)
-{
-	ParamListInfo paramLI;
-
-	if (nargs > 0)
-	{
-		int			i;
-
-		/* sizeof(ParamListInfoData) includes the first array element */
-		paramLI = (ParamListInfo) palloc(sizeof(ParamListInfoData) +
-									   (nargs - 1) *sizeof(ParamExternData));
-		paramLI->numParams = nargs;
-
-		for (i = 0; i < nargs; i++)
-		{
-			ParamExternData *prm = &paramLI->params[i];
-
-			prm->value = Values[i];
-			prm->isnull = (Nulls && Nulls[i] == 'n');
-			prm->pflags = pflags;
-			prm->ptype = argtypes[i];
-		}
-	}
-	else
-		paramLI = NULL;
-	return paramLI;
 }
 
 static int
@@ -2023,7 +1772,6 @@ _SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, long tcount)
 		AfterTriggerEndQuery(queryDesc->estate);
 
 	ExecutorEnd(queryDesc);
-	/* FreeQueryDesc is done by the caller */
 
 #ifdef SPI_EXECUTOR_STATS
 	if (ShowExecutorStats)

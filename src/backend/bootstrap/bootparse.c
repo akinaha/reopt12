@@ -126,12 +126,12 @@
  * bootparse.y
  *	  yacc grammar for the "bootstrap" mode (BKI file format)
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/bootstrap/bootparse.y,v 1.96 2009/01/01 17:23:36 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/bootstrap/bootparse.y,v 1.91 2008/01/01 19:45:48 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -176,17 +176,6 @@
 #define atooid(x)	((Oid) strtoul((x), NULL, 10))
 
 
-/*
- * Bison doesn't allocate anything that needs to live across parser calls,
- * so we can easily have it use palloc instead of malloc.  This prevents
- * memory leaks if we error out during parsing.  Note this only works with
- * bison >= 2.0.  However, in bison 1.875 the default is to use alloca()
- * if possible, so there's not really much problem anyhow, at least if
- * you're building with gcc.
- */
-#define YYMALLOC palloc
-#define YYFREE   pfree
-
 static void
 do_start(void)
 {
@@ -227,7 +216,7 @@ int num_columns_read = 0;
 #endif
 
 #if ! defined (YYSTYPE) && ! defined (YYSTYPE_IS_DECLARED)
-#line 98 "bootparse.y"
+#line 86 "bootparse.y"
 typedef union YYSTYPE {
 	List		*list;
 	IndexElem	*ielem;
@@ -236,7 +225,7 @@ typedef union YYSTYPE {
 	Oid			oidval;
 } YYSTYPE;
 /* Line 186 of yacc.c.  */
-#line 239 "bootparse.c"
+#line 228 "y.tab.c"
 # define yystype YYSTYPE /* obsolescent; will be withdrawn */
 # define YYSTYPE_IS_DECLARED 1
 # define YYSTYPE_IS_TRIVIAL 1
@@ -248,7 +237,7 @@ typedef union YYSTYPE {
 
 
 /* Line 214 of yacc.c.  */
-#line 251 "bootparse.c"
+#line 240 "y.tab.c"
 
 #if ! defined (yyoverflow) || YYERROR_VERBOSE
 
@@ -434,11 +423,11 @@ static const yysigned_char yyrhs[] =
 /* YYRLINE[YYN] -- source line where rule number YYN was defined.  */
 static const unsigned short yyrline[] =
 {
-       0,   126,   126,   127,   131,   132,   136,   137,   138,   139,
-     140,   141,   142,   143,   147,   156,   162,   172,   182,   171,
-     237,   236,   258,   276,   294,   304,   314,   315,   319,   332,
-     333,   337,   338,   342,   343,   347,   348,   352,   361,   365,
-     366,   370,   371,   372,   376,   378,   380,   385,   389
+       0,   114,   114,   115,   119,   120,   124,   125,   126,   127,
+     128,   129,   130,   131,   135,   144,   150,   160,   170,   159,
+     224,   223,   245,   263,   281,   291,   301,   302,   306,   319,
+     320,   324,   325,   329,   330,   334,   335,   339,   348,   352,
+     353,   357,   358,   359,   363,   365,   367,   372,   376
 };
 #endif
 
@@ -1197,34 +1186,34 @@ yyreduce:
   switch (yyn)
     {
         case 14:
-#line 148 "bootparse.y"
+#line 136 "bootparse.y"
     {
 					do_start();
 					boot_openrel(LexIDStr(yyvsp[0].ival));
 					do_end();
-				;}
+				}
     break;
 
   case 15:
-#line 157 "bootparse.y"
+#line 145 "bootparse.y"
     {
 					do_start();
 					closerel(LexIDStr(yyvsp[0].ival));
 					do_end();
-				;}
+				}
     break;
 
   case 16:
-#line 163 "bootparse.y"
+#line 151 "bootparse.y"
     {
 					do_start();
 					closerel(NULL);
 					do_end();
-				;}
+				}
     break;
 
   case 17:
-#line 172 "bootparse.y"
+#line 160 "bootparse.y"
     {
 					do_start();
 					numattr = 0;
@@ -1233,18 +1222,18 @@ yyreduce:
 						 yyvsp[-4].ival ? " shared" : "",
 						 LexIDStr(yyvsp[-2].ival),
 						 yyvsp[-1].oidval);
-				;}
+				}
     break;
 
   case 18:
-#line 182 "bootparse.y"
+#line 170 "bootparse.y"
     {
 					do_end();
-				;}
+				}
     break;
 
   case 19:
-#line 186 "bootparse.y"
+#line 174 "bootparse.y"
     {
 					TupleDesc tupdesc;
 
@@ -1280,7 +1269,6 @@ yyreduce:
 													  yyvsp[-5].oidval,
 													  BOOTSTRAP_SUPERUSERID,
 													  tupdesc,
-													  NIL,
 													  RELKIND_RELATION,
 													  yyvsp[-8].ival,
 													  true,
@@ -1291,11 +1279,11 @@ yyreduce:
 						elog(DEBUG4, "relation created with oid %u", id);
 					}
 					do_end();
-				;}
+				}
     break;
 
   case 20:
-#line 237 "bootparse.y"
+#line 224 "bootparse.y"
     {
 					do_start();
 					if (yyvsp[0].oidval)
@@ -1303,11 +1291,11 @@ yyreduce:
 					else
 						elog(DEBUG4, "inserting row");
 					num_columns_read = 0;
-				;}
+				}
     break;
 
   case 21:
-#line 246 "bootparse.y"
+#line 233 "bootparse.y"
     {
 					if (num_columns_read != numattr)
 						elog(ERROR, "incorrect number of columns in row (expected %d, got %d)",
@@ -1316,15 +1304,15 @@ yyreduce:
 						elog(FATAL, "relation not open");
 					InsertOneTuple(yyvsp[-4].oidval);
 					do_end();
-				;}
+				}
     break;
 
   case 22:
-#line 259 "bootparse.y"
+#line 246 "bootparse.y"
     {
 					do_start();
 
-					DefineIndex(makeRangeVar(NULL, LexIDStr(yyvsp[-5].ival), -1),
+					DefineIndex(makeRangeVar(NULL, LexIDStr(yyvsp[-5].ival)),
 								LexIDStr(yyvsp[-8].ival),
 								yyvsp[-7].oidval,
 								LexIDStr(yyvsp[-3].ival),
@@ -1334,15 +1322,15 @@ yyreduce:
 								false, false, false,
 								false, false, true, false, false);
 					do_end();
-				;}
+				}
     break;
 
   case 23:
-#line 277 "bootparse.y"
+#line 264 "bootparse.y"
     {
 					do_start();
 
-					DefineIndex(makeRangeVar(NULL, LexIDStr(yyvsp[-5].ival), -1),
+					DefineIndex(makeRangeVar(NULL, LexIDStr(yyvsp[-5].ival)),
 								LexIDStr(yyvsp[-8].ival),
 								yyvsp[-7].oidval,
 								LexIDStr(yyvsp[-3].ival),
@@ -1352,40 +1340,40 @@ yyreduce:
 								true, false, false,
 								false, false, true, false, false);
 					do_end();
-				;}
+				}
     break;
 
   case 24:
-#line 295 "bootparse.y"
+#line 282 "bootparse.y"
     {
 					do_start();
 
 					BootstrapToastTable(LexIDStr(yyvsp[0].ival), yyvsp[-3].oidval, yyvsp[-2].oidval);
 					do_end();
-				;}
+				}
     break;
 
   case 25:
-#line 305 "bootparse.y"
+#line 292 "bootparse.y"
     {
 					do_start();
 					build_indices();
 					do_end();
-				;}
+				}
     break;
 
   case 26:
-#line 314 "bootparse.y"
-    { yyval.list = lappend(yyvsp[-2].list, yyvsp[0].ielem); ;}
+#line 301 "bootparse.y"
+    { yyval.list = lappend(yyvsp[-2].list, yyvsp[0].ielem); }
     break;
 
   case 27:
-#line 315 "bootparse.y"
-    { yyval.list = list_make1(yyvsp[0].ielem); ;}
+#line 302 "bootparse.y"
+    { yyval.list = list_make1(yyvsp[0].ielem); }
     break;
 
   case 28:
-#line 320 "bootparse.y"
+#line 307 "bootparse.y"
     {
 					IndexElem *n = makeNode(IndexElem);
 					n->name = LexIDStr(yyvsp[-1].ival);
@@ -1394,93 +1382,93 @@ yyreduce:
 					n->ordering = SORTBY_DEFAULT;
 					n->nulls_ordering = SORTBY_NULLS_DEFAULT;
 					yyval.ielem = n;
-				;}
+				}
     break;
 
   case 29:
-#line 332 "bootparse.y"
-    { yyval.ival = 1; ;}
+#line 319 "bootparse.y"
+    { yyval.ival = 1; }
     break;
 
   case 30:
-#line 333 "bootparse.y"
-    { yyval.ival = 0; ;}
+#line 320 "bootparse.y"
+    { yyval.ival = 0; }
     break;
 
   case 31:
-#line 337 "bootparse.y"
-    { yyval.ival = 1; ;}
+#line 324 "bootparse.y"
+    { yyval.ival = 1; }
     break;
 
   case 32:
-#line 338 "bootparse.y"
-    { yyval.ival = 0; ;}
+#line 325 "bootparse.y"
+    { yyval.ival = 0; }
     break;
 
   case 33:
-#line 342 "bootparse.y"
-    { yyval.ival = 1; ;}
+#line 329 "bootparse.y"
+    { yyval.ival = 1; }
     break;
 
   case 34:
-#line 343 "bootparse.y"
-    { yyval.ival = 0; ;}
+#line 330 "bootparse.y"
+    { yyval.ival = 0; }
     break;
 
   case 37:
-#line 353 "bootparse.y"
+#line 340 "bootparse.y"
     {
 				   if (++numattr > MAXATTR)
 						elog(FATAL, "too many columns");
 				   DefineAttr(LexIDStr(yyvsp[-2].ival),LexIDStr(yyvsp[0].ival),numattr-1);
-				;}
+				}
     break;
 
   case 38:
-#line 361 "bootparse.y"
-    { yyval.oidval = atooid(LexIDStr(yyvsp[0].ival)); ;}
+#line 348 "bootparse.y"
+    { yyval.oidval = atooid(LexIDStr(yyvsp[0].ival)); }
     break;
 
   case 39:
-#line 365 "bootparse.y"
-    { yyval.oidval = yyvsp[0].oidval; ;}
+#line 352 "bootparse.y"
+    { yyval.oidval = yyvsp[0].oidval; }
     break;
 
   case 40:
-#line 366 "bootparse.y"
-    { yyval.oidval = (Oid) 0; ;}
+#line 353 "bootparse.y"
+    { yyval.oidval = (Oid) 0; }
     break;
 
   case 44:
-#line 377 "bootparse.y"
-    { InsertOneValue(LexIDStr(yyvsp[0].ival), num_columns_read++); ;}
+#line 364 "bootparse.y"
+    { InsertOneValue(LexIDStr(yyvsp[0].ival), num_columns_read++); }
     break;
 
   case 45:
-#line 379 "bootparse.y"
-    { InsertOneValue(LexIDStr(yyvsp[0].ival), num_columns_read++); ;}
+#line 366 "bootparse.y"
+    { InsertOneValue(LexIDStr(yyvsp[0].ival), num_columns_read++); }
     break;
 
   case 46:
-#line 381 "bootparse.y"
-    { InsertOneNull(num_columns_read++); ;}
+#line 368 "bootparse.y"
+    { InsertOneNull(num_columns_read++); }
     break;
 
   case 47:
-#line 385 "bootparse.y"
-    { yyval.ival=yylval.ival; ;}
+#line 372 "bootparse.y"
+    { yyval.ival=yylval.ival; }
     break;
 
   case 48:
-#line 389 "bootparse.y"
-    { yyval.ival=yylval.ival; ;}
+#line 376 "bootparse.y"
+    { yyval.ival=yylval.ival; }
     break;
 
 
     }
 
 /* Line 991 of yacc.c.  */
-#line 1483 "bootparse.c"
+#line 1471 "y.tab.c"
 
   yyvsp -= yylen;
   yyssp -= yylen;
@@ -1689,9 +1677,8 @@ yyreturn:
 }
 
 
-#line 391 "bootparse.y"
+#line 378 "bootparse.y"
 
 
 #include "bootscanner.c"
-
 

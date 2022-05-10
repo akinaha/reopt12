@@ -4,11 +4,11 @@
  *	  routines for fast build of inverted index
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *			$PostgreSQL: pgsql/src/backend/access/gin/ginbulk.c,v 1.16 2009/06/11 14:48:53 momjian Exp $
+ *			$PostgreSQL: pgsql/src/backend/access/gin/ginbulk.c,v 1.11 2008/01/01 19:45:46 momjian Exp $
  *-------------------------------------------------------------------------
  */
 
@@ -78,21 +78,29 @@ ginInsertData(BuildAccumulator *accum, EntryAccumulator *entry, ItemPointer heap
 }
 
 /*
- * This is basically the same as datumCopy(), but modified to count
- * palloc'd space in accum.
+ * This is basically the same as datumCopy(), but we duplicate some code
+ * to avoid computing the datum size twice.
  */
 static Datum
-getDatumCopy(BuildAccumulator *accum, OffsetNumber attnum, Datum value)
+getDatumCopy(BuildAccumulator *accum, Datum value)
 {
-	Form_pg_attribute att = accum->ginstate->origTupdesc->attrs[attnum - 1];
+	Form_pg_attribute *att = accum->ginstate->tupdesc->attrs;
 	Datum		res;
 
-	if (att->attbyval)
+	if (att[0]->attbyval)
 		res = value;
 	else
 	{
-		res = datumCopy(value, false, att->attlen);
-		accum->allocatedMemory += GetMemoryChunkSpace(DatumGetPointer(res));
+		Size		realSize;
+		char	   *s;
+
+		realSize = datumGetSize(value, false, att[0]->attlen);
+
+		s = (char *) palloc(realSize);
+		accum->allocatedMemory += GetMemoryChunkSpace(s);
+
+		memcpy(s, DatumGetPointer(value), realSize);
+		res = PointerGetDatum(s);
 	}
 	return res;
 }
@@ -101,7 +109,7 @@ getDatumCopy(BuildAccumulator *accum, OffsetNumber attnum, Datum value)
  * Find/store one entry from indexed value.
  */
 static void
-ginInsertEntry(BuildAccumulator *accum, ItemPointer heapptr, OffsetNumber attnum, Datum entry)
+ginInsertEntry(BuildAccumulator *accum, ItemPointer heapptr, Datum entry)
 {
 	EntryAccumulator *ea = accum->entries,
 			   *pea = NULL;
@@ -110,7 +118,7 @@ ginInsertEntry(BuildAccumulator *accum, ItemPointer heapptr, OffsetNumber attnum
 
 	while (ea)
 	{
-		res = compareAttEntries(accum->ginstate, attnum, entry, ea->attnum, ea->value);
+		res = compareEntries(accum->ginstate, entry, ea->value);
 		if (res == 0)
 			break;				/* found */
 		else
@@ -132,8 +140,7 @@ ginInsertEntry(BuildAccumulator *accum, ItemPointer heapptr, OffsetNumber attnum
 		ea = EAAllocate(accum);
 
 		ea->left = ea->right = NULL;
-		ea->attnum = attnum;
-		ea->value = getDatumCopy(accum, attnum, entry);
+		ea->value = getDatumCopy(accum, entry);
 		ea->length = DEF_NPTR;
 		ea->number = 1;
 		ea->shouldSort = FALSE;
@@ -161,8 +168,7 @@ ginInsertEntry(BuildAccumulator *accum, ItemPointer heapptr, OffsetNumber attnum
  * then calls itself for each parts
  */
 static void
-ginChooseElem(BuildAccumulator *accum, ItemPointer heapptr, OffsetNumber attnum,
-			  Datum *entries, uint32 nentry,
+ginChooseElem(BuildAccumulator *accum, ItemPointer heapptr, Datum *entries, uint32 nentry,
 			  uint32 low, uint32 high, uint32 offset)
 {
 	uint32		pos;
@@ -170,15 +176,15 @@ ginChooseElem(BuildAccumulator *accum, ItemPointer heapptr, OffsetNumber attnum,
 
 	pos = (low + middle) >> 1;
 	if (low != middle && pos >= offset && pos - offset < nentry)
-		ginInsertEntry(accum, heapptr, attnum, entries[pos - offset]);
+		ginInsertEntry(accum, heapptr, entries[pos - offset]);
 	pos = (high + middle + 1) >> 1;
 	if (middle + 1 != high && pos >= offset && pos - offset < nentry)
-		ginInsertEntry(accum, heapptr, attnum, entries[pos - offset]);
+		ginInsertEntry(accum, heapptr, entries[pos - offset]);
 
 	if (low != middle)
-		ginChooseElem(accum, heapptr, attnum, entries, nentry, low, middle, offset);
+		ginChooseElem(accum, heapptr, entries, nentry, low, middle, offset);
 	if (high != middle + 1)
-		ginChooseElem(accum, heapptr, attnum, entries, nentry, middle + 1, high, offset);
+		ginChooseElem(accum, heapptr, entries, nentry, middle + 1, high, offset);
 }
 
 /*
@@ -187,8 +193,7 @@ ginChooseElem(BuildAccumulator *accum, ItemPointer heapptr, OffsetNumber attnum,
  * next middle on left part and middle of right part.
  */
 void
-ginInsertRecordBA(BuildAccumulator *accum, ItemPointer heapptr, OffsetNumber attnum,
-				  Datum *entries, int32 nentry)
+ginInsertRecordBA(BuildAccumulator *accum, ItemPointer heapptr, Datum *entries, int32 nentry)
 {
 	uint32		i,
 				nbit = 0,
@@ -197,8 +202,6 @@ ginInsertRecordBA(BuildAccumulator *accum, ItemPointer heapptr, OffsetNumber att
 	if (nentry <= 0)
 		return;
 
-	Assert(ItemPointerIsValid(heapptr) && attnum >= FirstOffsetNumber);
-
 	i = nentry - 1;
 	for (; i > 0; i >>= 1)
 		nbit++;
@@ -206,8 +209,8 @@ ginInsertRecordBA(BuildAccumulator *accum, ItemPointer heapptr, OffsetNumber att
 	nbit = 1 << nbit;
 	offset = (nbit - nentry) / 2;
 
-	ginInsertEntry(accum, heapptr, attnum, entries[(nbit >> 1) - offset]);
-	ginChooseElem(accum, heapptr, attnum, entries, nentry, 0, nbit, offset);
+	ginInsertEntry(accum, heapptr, entries[(nbit >> 1) - offset]);
+	ginChooseElem(accum, heapptr, entries, nentry, 0, nbit, offset);
 }
 
 static int
@@ -264,7 +267,7 @@ walkTree(BuildAccumulator *accum)
 }
 
 ItemPointerData *
-ginGetEntry(BuildAccumulator *accum, OffsetNumber *attnum, Datum *value, uint32 *n)
+ginGetEntry(BuildAccumulator *accum, Datum *value, uint32 *n)
 {
 	EntryAccumulator *entry;
 	ItemPointerData *list;
@@ -304,7 +307,6 @@ ginGetEntry(BuildAccumulator *accum, OffsetNumber *attnum, Datum *value, uint32 
 		return NULL;
 
 	*n = entry->number;
-	*attnum = entry->attnum;
 	*value = entry->value;
 	list = entry->list;
 

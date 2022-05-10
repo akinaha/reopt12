@@ -3,12 +3,12 @@
  * nodeMergejoin.c
  *	  routines supporting merge joins
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeMergejoin.c,v 1.97.2.1 2010/01/05 23:25:44 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/executor/nodeMergejoin.c,v 1.90 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -180,6 +180,7 @@ MJExamineQuals(List *mergeclauses,
 		int			op_strategy;
 		Oid			op_lefttype;
 		Oid			op_righttype;
+		bool		op_recheck;
 		RegProcedure cmpproc;
 		AclResult	aclresult;
 
@@ -196,10 +197,12 @@ MJExamineQuals(List *mergeclauses,
 		get_op_opfamily_properties(qual->opno, opfamily,
 								   &op_strategy,
 								   &op_lefttype,
-								   &op_righttype);
+								   &op_righttype,
+								   &op_recheck);
 		if (op_strategy != BTEqualStrategyNumber)		/* should not happen */
 			elog(ERROR, "cannot merge using non-equality operator %u",
 				 qual->opno);
+		Assert(!op_recheck);	/* never true for btree */
 
 		/* And get the matching support procedure (comparison function) */
 		cmpproc = get_opfamily_proc(opfamily,
@@ -398,13 +401,8 @@ MJCompare(MergeJoinState *mergestate)
 	 * want to report that the tuples are equal.  Instead, if result is still
 	 * 0, change it to +1.	This will result in advancing the inner side of
 	 * the join.
-	 *
-	 * Likewise, if there was a constant-false joinqual, do not report
-	 * equality.  We have to check this as part of the mergequals, else the
-	 * rescan logic will do the wrong thing.
 	 */
-	if (result == 0 &&
-		(nulleqnull || mergestate->mj_ConstFalseJoin))
+	if (nulleqnull && result == 0)
 		result = 1;
 
 	MemoryContextSwitchTo(oldContext);
@@ -489,32 +487,6 @@ MJFillInner(MergeJoinState *node)
 	}
 
 	return NULL;
-}
-
-
-/*
- * Check that a qual condition is constant true or constant false.
- * If it is constant false (or null), set *is_const_false to TRUE.
- *
- * Constant true would normally be represented by a NIL list, but we allow an
- * actual bool Const as well.  We do expect that the planner will have thrown
- * away any non-constant terms that have been ANDed with a constant false.
- */
-static bool
-check_constant_qual(List *qual, bool *is_const_false)
-{
-	ListCell   *lc;
-
-	foreach(lc, qual)
-	{
-		Const  *con = (Const *) lfirst(lc);
-
-		if (!con || !IsA(con, Const))
-			return false;
-		if (con->constisnull || !DatumGetBool(con->constvalue))
-			*is_const_false = true;
-	}
-	return true;
 }
 
 
@@ -788,28 +760,20 @@ ExecMergeJoin(MergeJoinState *node)
 				innerTupleSlot = node->mj_InnerTupleSlot;
 				econtext->ecxt_innertuple = innerTupleSlot;
 
-				qualResult = (joinqual == NIL ||
-							  ExecQual(joinqual, econtext, false));
-				MJ_DEBUG_QUAL(joinqual, qualResult);
+				if (node->js.jointype == JOIN_IN &&
+					node->mj_MatchedOuter)
+					qualResult = false;
+				else
+				{
+					qualResult = (joinqual == NIL ||
+								  ExecQual(joinqual, econtext, false));
+					MJ_DEBUG_QUAL(joinqual, qualResult);
+				}
 
 				if (qualResult)
 				{
 					node->mj_MatchedOuter = true;
 					node->mj_MatchedInner = true;
-
-					/* In an antijoin, we never return a matched tuple */
-					if (node->js.jointype == JOIN_ANTI)
-					{
-						node->mj_JoinState = EXEC_MJ_NEXTOUTER;
-						break;
-					}
-
-					/*
-					 * In a semijoin, we'll consider returning the first
-					 * match, but after that we're done with this outer tuple.
-					 */
-					if (node->js.jointype == JOIN_SEMI)
-						node->mj_JoinState = EXEC_MJ_NEXTOUTER;
 
 					qualResult = (otherqual == NIL ||
 								  ExecQual(otherqual, econtext, false));
@@ -1056,13 +1020,9 @@ ExecMergeJoin(MergeJoinState *node)
 					 * state for the rescanned inner tuples.  We know all of
 					 * them will match this new outer tuple and therefore
 					 * won't be emitted as fill tuples.  This works *only*
-					 * because we require the extra joinquals to be constant
-					 * when doing a right or full join --- otherwise some of
-					 * the rescanned tuples might fail the extra joinquals.
-					 * This obviously won't happen for a constant-true extra
-					 * joinqual, while the constant-false case is handled by
-					 * forcing the merge clause to never match, so we never
-					 * get here.
+					 * because we require the extra joinquals to be nil when
+					 * doing a right or full join --- otherwise some of the
+					 * rescanned tuples might fail the extra joinquals.
 					 */
 					ExecRestrPos(innerPlan);
 
@@ -1474,7 +1434,6 @@ ExecInitMergeJoin(MergeJoin *node, EState *estate, int eflags)
 	mergestate->js.joinqual = (List *)
 		ExecInitExpr((Expr *) node->join.joinqual,
 					 (PlanState *) mergestate);
-	mergestate->mj_ConstFalseJoin = false;
 	/* mergeclauses are handled below */
 
 	/*
@@ -1516,12 +1475,11 @@ ExecInitMergeJoin(MergeJoin *node, EState *estate, int eflags)
 	switch (node->join.jointype)
 	{
 		case JOIN_INNER:
-		case JOIN_SEMI:
+		case JOIN_IN:
 			mergestate->mj_FillOuter = false;
 			mergestate->mj_FillInner = false;
 			break;
 		case JOIN_LEFT:
-		case JOIN_ANTI:
 			mergestate->mj_FillOuter = true;
 			mergestate->mj_FillInner = false;
 			mergestate->mj_NullInnerTupleSlot =
@@ -1536,11 +1494,10 @@ ExecInitMergeJoin(MergeJoin *node, EState *estate, int eflags)
 							  ExecGetResultType(outerPlanState(mergestate)));
 
 			/*
-			 * Can't handle right or full join with non-constant extra
-			 * joinclauses.  This should have been caught by planner.
+			 * Can't handle right or full join with non-nil extra joinclauses.
+			 * This should have been caught by planner.
 			 */
-			if (!check_constant_qual(node->join.joinqual,
-									 &mergestate->mj_ConstFalseJoin))
+			if (node->join.joinqual != NIL)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("RIGHT JOIN is only supported with merge-joinable join conditions")));
@@ -1556,11 +1513,9 @@ ExecInitMergeJoin(MergeJoin *node, EState *estate, int eflags)
 							  ExecGetResultType(innerPlanState(mergestate)));
 
 			/*
-			 * Can't handle right or full join with non-constant extra
-			 * joinclauses.  This should have been caught by planner.
+			 * Can't handle right or full join with non-nil extra joinclauses.
 			 */
-			if (!check_constant_qual(node->join.joinqual,
-									 &mergestate->mj_ConstFalseJoin))
+			if (node->join.joinqual != NIL)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("FULL JOIN is only supported with merge-joinable join conditions")));

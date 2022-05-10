@@ -4,12 +4,12 @@
  *		Routines for handling specialized SET variables.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/variable.c,v 1.130.2.1 2009/09/03 22:08:13 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/variable.c,v 1.125 2008/01/03 21:23:15 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -25,7 +25,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/syscache.h"
-#include "utils/snapmgr.h"
+#include "utils/tqual.h"
 #include "mb/pg_wchar.h"
 
 /*
@@ -268,7 +268,7 @@ assign_timezone(const char *value, bool doit, GucSource source)
 
 		/*
 		 * Try to parse it.  XXX an invalid interval format will result in
-		 * ereport(ERROR), which is not desirable for GUC.	We did what we
+		 * ereport(ERROR), which is not desirable for GUC.  We did what we
 		 * could to guard against this in flatten_set_variable_args, but a
 		 * string coming in from postgresql.conf might contain anything.
 		 */
@@ -290,7 +290,7 @@ assign_timezone(const char *value, bool doit, GucSource source)
 		{
 			ereport(GUC_complaint_elevel(source),
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			errmsg("invalid interval value for time zone: day not allowed")));
+					 errmsg("invalid interval value for time zone: day not allowed")));
 			pfree(interval);
 			return NULL;
 		}
@@ -550,7 +550,7 @@ show_log_timezone(void)
 const char *
 assign_XactIsoLevel(const char *value, bool doit, GucSource source)
 {
-	if (FirstSnapshotSet)
+	if (SerializableSnapshot != NULL)
 	{
 		ereport(GUC_complaint_elevel(source),
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
@@ -717,6 +717,21 @@ assign_session_authorization(const char *value, bool doit, GucSource source)
 		/* not a saved ID, so look it up */
 		HeapTuple	roleTup;
 
+		if (InSecurityDefinerContext())
+		{
+			/*
+			 * Disallow SET SESSION AUTHORIZATION inside a security definer
+			 * context.  We need to do this because when we exit the context,
+			 * GUC won't be notified, leaving things out of sync.  Note that
+			 * this test is positioned so that restoring a previously saved
+			 * setting isn't prevented.
+			 */
+			ereport(GUC_complaint_elevel(source),
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot set session authorization within security-definer function")));
+			return NULL;
+		}
+
 		if (!IsTransactionState())
 		{
 			/*
@@ -821,6 +836,24 @@ assign_role(const char *value, bool doit, GucSource source)
 			is_superuser = (value[NAMEDATALEN] == 'T');
 			actual_rolename = endptr + 1;
 		}
+	}
+
+	if (roleid == InvalidOid && InSecurityDefinerContext())
+	{
+		/*
+		 * Disallow SET ROLE inside a security definer context.  We need to do
+		 * this because when we exit the context, GUC won't be notified,
+		 * leaving things out of sync.  Note that this test is arranged so
+		 * that restoring a previously saved setting isn't prevented.
+		 *
+		 * XXX it would be nice to allow this case in future, with the
+		 * behavior being that the SET ROLE's effects end when the security
+		 * definer context is exited.
+		 */
+		ereport(GUC_complaint_elevel(source),
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot set role within security-definer function")));
+		return NULL;
 	}
 
 	if (roleid == InvalidOid &&

@@ -3,12 +3,12 @@
  * tupdesc.c
  *	  POSTGRES tuple descriptor support code
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/common/tupdesc.c,v 1.126 2009/06/11 14:48:53 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/access/common/tupdesc.c,v 1.122 2008/01/01 19:45:46 momjian Exp $
  *
  * NOTES
  *	  some of the executor utility code such as "ExecTypeFromTL" should be
@@ -53,14 +53,10 @@ CreateTemplateTupleDesc(int natts, bool hasoid)
 	 * struct pointer alignment requirement, and hence we don't need to insert
 	 * alignment padding between the struct and the array of attribute row
 	 * pointers.
-	 *
-	 * Note: Only the fixed part of pg_attribute rows is included in tuple
-	 * descriptors, so we only need ATTRIBUTE_FIXED_PART_SIZE space per attr.
-	 * That might need alignment padding, however.
 	 */
 	attroffset = sizeof(struct tupleDesc) + natts * sizeof(Form_pg_attribute);
 	attroffset = MAXALIGN(attroffset);
-	stg = palloc(attroffset + natts * MAXALIGN(ATTRIBUTE_FIXED_PART_SIZE));
+	stg = palloc(attroffset + natts * MAXALIGN(ATTRIBUTE_TUPLE_SIZE));
 	desc = (TupleDesc) stg;
 
 	if (natts > 0)
@@ -74,7 +70,7 @@ CreateTemplateTupleDesc(int natts, bool hasoid)
 		for (i = 0; i < natts; i++)
 		{
 			attrs[i] = (Form_pg_attribute) stg;
-			stg += MAXALIGN(ATTRIBUTE_FIXED_PART_SIZE);
+			stg += MAXALIGN(ATTRIBUTE_TUPLE_SIZE);
 		}
 	}
 	else
@@ -143,7 +139,7 @@ CreateTupleDescCopy(TupleDesc tupdesc)
 
 	for (i = 0; i < desc->natts; i++)
 	{
-		memcpy(desc->attrs[i], tupdesc->attrs[i], ATTRIBUTE_FIXED_PART_SIZE);
+		memcpy(desc->attrs[i], tupdesc->attrs[i], ATTRIBUTE_TUPLE_SIZE);
 		desc->attrs[i]->attnotnull = false;
 		desc->attrs[i]->atthasdef = false;
 	}
@@ -170,7 +166,7 @@ CreateTupleDescCopyConstr(TupleDesc tupdesc)
 
 	for (i = 0; i < desc->natts; i++)
 	{
-		memcpy(desc->attrs[i], tupdesc->attrs[i], ATTRIBUTE_FIXED_PART_SIZE);
+		memcpy(desc->attrs[i], tupdesc->attrs[i], ATTRIBUTE_TUPLE_SIZE);
 	}
 
 	if (constr)
@@ -360,7 +356,6 @@ equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2)
 			return false;
 		if (attr1->attinhcount != attr2->attinhcount)
 			return false;
-		/* attacl is ignored, since it's not even present... */
 	}
 
 	if (tupdesc1->constr != NULL)
@@ -476,7 +471,6 @@ TupleDescInitEntry(TupleDesc desc,
 	att->attisdropped = false;
 	att->attislocal = true;
 	att->attinhcount = 0;
-	/* attacl is not set because it's not present in tupledescs */
 
 	tuple = SearchSysCache(TYPEOID,
 						   ObjectIdGetDatum(oidtypeid),
@@ -511,18 +505,20 @@ BuildDescForRelation(List *schema)
 	AttrNumber	attnum;
 	ListCell   *l;
 	TupleDesc	desc;
-	bool		has_not_null;
+	AttrDefault *attrdef = NULL;
+	TupleConstr *constr = (TupleConstr *) palloc0(sizeof(TupleConstr));
 	char	   *attname;
 	Oid			atttypid;
 	int32		atttypmod;
 	int			attdim;
+	int			ndef = 0;
 
 	/*
 	 * allocate a new tuple descriptor
 	 */
 	natts = list_length(schema);
 	desc = CreateTemplateTupleDesc(natts, false);
-	has_not_null = false;
+	constr->has_not_null = false;
 
 	attnum = 0;
 
@@ -551,25 +547,52 @@ BuildDescForRelation(List *schema)
 						   atttypid, atttypmod, attdim);
 
 		/* Fill in additional stuff not handled by TupleDescInitEntry */
+		if (entry->is_not_null)
+			constr->has_not_null = true;
 		desc->attrs[attnum - 1]->attnotnull = entry->is_not_null;
-		has_not_null |= entry->is_not_null;
+
+		/*
+		 * Note we copy only pre-cooked default expressions. Digestion of raw
+		 * ones is someone else's problem.
+		 */
+		if (entry->cooked_default != NULL)
+		{
+			if (attrdef == NULL)
+				attrdef = (AttrDefault *) palloc(natts * sizeof(AttrDefault));
+			attrdef[ndef].adnum = attnum;
+			attrdef[ndef].adbin = pstrdup(entry->cooked_default);
+			ndef++;
+			desc->attrs[attnum - 1]->atthasdef = true;
+		}
+
 		desc->attrs[attnum - 1]->attislocal = entry->is_local;
 		desc->attrs[attnum - 1]->attinhcount = entry->inhcount;
 	}
 
-	if (has_not_null)
+	if (constr->has_not_null || ndef > 0)
 	{
-		TupleConstr *constr = (TupleConstr *) palloc0(sizeof(TupleConstr));
+		desc->constr = constr;
 
-		constr->has_not_null = true;
-		constr->defval = NULL;
-		constr->num_defval = 0;
+		if (ndef > 0)			/* DEFAULTs */
+		{
+			if (ndef < natts)
+				constr->defval = (AttrDefault *)
+					repalloc(attrdef, ndef * sizeof(AttrDefault));
+			else
+				constr->defval = attrdef;
+			constr->num_defval = ndef;
+		}
+		else
+		{
+			constr->defval = NULL;
+			constr->num_defval = 0;
+		}
 		constr->check = NULL;
 		constr->num_check = 0;
-		desc->constr = constr;
 	}
 	else
 	{
+		pfree(constr);
 		desc->constr = NULL;
 	}
 

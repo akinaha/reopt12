@@ -4,11 +4,11 @@
  *	  interface routines for the postgres GiST index access method.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/gist/gist.c,v 1.156 2009/01/01 17:23:34 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/access/gist/gist.c,v 1.149 2008/01/01 19:45:46 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -18,8 +18,6 @@
 #include "access/gist_private.h"
 #include "catalog/index.h"
 #include "miscadmin.h"
-#include "storage/bufmgr.h"
-#include "storage/indexfsm.h"
 #include "utils/memutils.h"
 
 const XLogRecPtr XLogRecPtrForTemp = {1, 1};
@@ -149,7 +147,7 @@ gistbuild(PG_FUNCTION_ARGS)
 	buildstate.tmpCtx = createTempGistContext();
 
 	/* do the heap scan */
-	reltuples = IndexBuildHeapScan(heap, index, indexInfo, true,
+	reltuples = IndexBuildHeapScan(heap, index, indexInfo,
 								   gistbuildCallback, (void *) &buildstate);
 
 	/* okay, all heap tuples are indexed */
@@ -340,7 +338,7 @@ gistplacetopage(GISTInsertState *state, GISTSTATE *giststate)
 			 * we must create temporary page to operate
 			 */
 			dist->buffer = state->stack->buffer;
-			dist->page = PageGetTempPageCopySpecial(BufferGetPage(dist->buffer));
+			dist->page = PageGetTempPage(BufferGetPage(dist->buffer), sizeof(GISTPageOpaqueData));
 
 			/* clean all flags except F_LEAF */
 			GistPageGetOpaque(dist->page)->flags = (is_leaf) ? F_LEAF : 0;
@@ -463,7 +461,7 @@ gistplacetopage(GISTInsertState *state, GISTSTATE *giststate)
 
 		if (!is_leaf)
 			PageIndexTupleDelete(state->stack->page, state->stack->childoffnum);
-		gistfillbuffer(state->stack->page, state->itup, state->ituplen, InvalidOffsetNumber);
+		gistfillbuffer(state->r, state->stack->page, state->itup, state->ituplen, InvalidOffsetNumber);
 
 		MarkBufferDirty(state->stack->buffer);
 
@@ -1009,7 +1007,7 @@ gistnewroot(Relation r, Buffer buffer, IndexTuple *itup, int len, ItemPointer ke
 	START_CRIT_SECTION();
 
 	GISTInitBuffer(buffer, 0);
-	gistfillbuffer(page, itup, len, FirstOffsetNumber);
+	gistfillbuffer(r, page, itup, len, FirstOffsetNumber);
 
 	MarkBufferDirty(buffer);
 

@@ -3,10 +3,10 @@
  * varsup.c
  *	  postgres OID & XID variables support routines
  *
- * Copyright (c) 2000-2009, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2008, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/transam/varsup.c,v 1.84 2009/04/23 00:23:45 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/access/transam/varsup.c,v 1.81 2008/01/01 19:45:48 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -86,16 +86,14 @@ GetNewTransactionId(bool isSubXact)
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("database is not accepting commands to avoid wraparound data loss in database \"%s\"",
 							NameStr(ShmemVariableCache->limit_datname)),
-					 errhint("Stop the postmaster and use a standalone backend to vacuum database \"%s\".\n"
-							 "You might also need to commit or roll back old prepared transactions.",
+					 errhint("Stop the postmaster and use a standalone backend to vacuum database \"%s\".",
 							 NameStr(ShmemVariableCache->limit_datname))));
 		else if (TransactionIdFollowsOrEquals(xid, ShmemVariableCache->xidWarnLimit))
 			ereport(WARNING,
 			(errmsg("database \"%s\" must be vacuumed within %u transactions",
 					NameStr(ShmemVariableCache->limit_datname),
 					ShmemVariableCache->xidWrapLimit - xid),
-			 errhint("To avoid a database shutdown, execute a database-wide VACUUM in \"%s\".\n"
-					 "You might also need to commit or roll back old prepared transactions.",
+			 errhint("To avoid a database shutdown, execute a full-database VACUUM in \"%s\".",
 					 NameStr(ShmemVariableCache->limit_datname))));
 	}
 
@@ -301,8 +299,7 @@ SetTransactionIdLimit(TransactionId oldest_datfrozenxid,
 		   (errmsg("database \"%s\" must be vacuumed within %u transactions",
 				   NameStr(*oldest_datname),
 				   xidWrapLimit - curXid),
-			errhint("To avoid a database shutdown, execute a database-wide VACUUM in \"%s\".\n"
-					"You might also need to commit or roll back old prepared transactions.",
+			errhint("To avoid a database shutdown, execute a full-database VACUUM in \"%s\".",
 					NameStr(*oldest_datname))));
 }
 

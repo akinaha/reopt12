@@ -6,11 +6,11 @@
  * This gives R-tree behavior, with Guttman's poly-time split algorithm.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	$PostgreSQL: pgsql/src/backend/access/gist/gistproc.c,v 1.17.2.1 2009/09/18 14:02:40 teodor Exp $
+ *	$PostgreSQL: pgsql/src/backend/access/gist/gistproc.c,v 1.13 2008/01/01 19:45:46 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -86,12 +86,6 @@ gist_box_consistent(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	BOX		   *query = PG_GETARG_BOX_P(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
-	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
-
-	/* All cases served by this function are exact */
-	*recheck = false;
 
 	if (DatumGetBoxP(entry->key) == NULL || query == NULL)
 		PG_RETURN_BOOL(FALSE);
@@ -234,9 +228,9 @@ chooseLR(GIST_SPLITVEC *v,
 						  NULL, NULL, InvalidOffsetNumber, FALSE);
 
 			gistentryinit(addon, BoxPGetDatum(union1), NULL, NULL, InvalidOffsetNumber, FALSE);
-			DirectFunctionCall3(gist_box_penalty, PointerGetDatum(&oldUnion), PointerGetDatum(&addon), PointerGetDatum(&p1));
+			DirectFunctionCall3(gist_box_penalty, PointerGetDatum(&oldUnion), PointerGetDatum(&union1), PointerGetDatum(&p1));
 			gistentryinit(addon, BoxPGetDatum(union2), NULL, NULL, InvalidOffsetNumber, FALSE);
-			DirectFunctionCall3(gist_box_penalty, PointerGetDatum(&oldUnion), PointerGetDatum(&addon), PointerGetDatum(&p2));
+			DirectFunctionCall3(gist_box_penalty, PointerGetDatum(&oldUnion), PointerGetDatum(&union2), PointerGetDatum(&p2));
 
 			if ((v->spl_ldatum_exists && p1 > p2) || (v->spl_rdatum_exists && p1 < p2))
 				firstToLeft = false;
@@ -269,69 +263,6 @@ chooseLR(GIST_SPLITVEC *v,
 			adjustBox(union1, DatumGetBoxP(v->spl_rdatum));
 		v->spl_rdatum = BoxPGetDatum(union1);
 	}
-
-	v->spl_ldatum_exists = v->spl_rdatum_exists = false;
-}
-
-/*
- * Trivial split: half of entries will be placed on one page
- * and another half - to another
- */
-static void
-fallbackSplit(GistEntryVector *entryvec, GIST_SPLITVEC *v)
-{
-	OffsetNumber i,
-				maxoff;
-	BOX		   *unionL = NULL,
-			   *unionR = NULL;
-	int			nbytes;
-
-	maxoff = entryvec->n - 1;
-
-	nbytes = (maxoff + 2) * sizeof(OffsetNumber);
-	v->spl_left = (OffsetNumber *) palloc(nbytes);
-	v->spl_right = (OffsetNumber *) palloc(nbytes);
-	v->spl_nleft = v->spl_nright = 0;
-
-	for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
-	{
-		BOX		   *cur = DatumGetBoxP(entryvec->vector[i].key);
-
-		if (i <= (maxoff - FirstOffsetNumber + 1) / 2)
-		{
-			v->spl_left[v->spl_nleft] = i;
-			if (unionL == NULL)
-			{
-				unionL = (BOX *) palloc(sizeof(BOX));
-				*unionL = *cur;
-			}
-			else
-				adjustBox(unionL, cur);
-
-			v->spl_nleft++;
-		}
-		else
-		{
-			v->spl_right[v->spl_nright] = i;
-			if (unionR == NULL)
-			{
-				unionR = (BOX *) palloc(sizeof(BOX));
-				*unionR = *cur;
-			}
-			else
-				adjustBox(unionR, cur);
-
-			v->spl_nright++;
-		}
-	}
-
-	if (v->spl_ldatum_exists)
-		adjustBox(unionL, DatumGetBoxP(v->spl_ldatum));
-	v->spl_ldatum = BoxPGetDatum(unionL);
-
-	if (v->spl_rdatum_exists)
-		adjustBox(unionR, DatumGetBoxP(v->spl_rdatum));
-	v->spl_rdatum = BoxPGetDatum(unionR);
 
 	v->spl_ldatum_exists = v->spl_rdatum_exists = false;
 }
@@ -388,22 +319,52 @@ gist_box_picksplit(PG_FUNCTION_ARGS)
 		adjustBox(&pageunion, cur);
 	}
 
-	if (allisequal)
-	{
-		/*
-		 * All entries are the same
-		 */
-		fallbackSplit(entryvec, v);
-		PG_RETURN_POINTER(v);
-	}
-
 	nbytes = (maxoff + 2) * sizeof(OffsetNumber);
 	listL = (OffsetNumber *) palloc(nbytes);
 	listR = (OffsetNumber *) palloc(nbytes);
-	listB = (OffsetNumber *) palloc(nbytes);
-	listT = (OffsetNumber *) palloc(nbytes);
 	unionL = (BOX *) palloc(sizeof(BOX));
 	unionR = (BOX *) palloc(sizeof(BOX));
+	if (allisequal)
+	{
+		cur = DatumGetBoxP(entryvec->vector[OffsetNumberNext(FirstOffsetNumber)].key);
+		if (memcmp((void *) cur, (void *) &pageunion, sizeof(BOX)) == 0)
+		{
+			v->spl_left = listL;
+			v->spl_right = listR;
+			v->spl_nleft = v->spl_nright = 0;
+			memcpy((void *) unionL, (void *) &pageunion, sizeof(BOX));
+			memcpy((void *) unionR, (void *) &pageunion, sizeof(BOX));
+
+			for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
+			{
+				if (i <= (maxoff - FirstOffsetNumber + 1) / 2)
+				{
+					v->spl_left[v->spl_nleft] = i;
+					v->spl_nleft++;
+				}
+				else
+				{
+					v->spl_right[v->spl_nright] = i;
+					v->spl_nright++;
+				}
+			}
+
+			if (v->spl_ldatum_exists)
+				adjustBox(unionL, DatumGetBoxP(v->spl_ldatum));
+			v->spl_ldatum = BoxPGetDatum(unionL);
+
+			if (v->spl_rdatum_exists)
+				adjustBox(unionR, DatumGetBoxP(v->spl_rdatum));
+			v->spl_rdatum = BoxPGetDatum(unionR);
+
+			v->spl_ldatum_exists = v->spl_rdatum_exists = false;
+
+			PG_RETURN_POINTER(v);
+		}
+	}
+
+	listB = (OffsetNumber *) palloc(nbytes);
+	listT = (OffsetNumber *) palloc(nbytes);
 	unionB = (BOX *) palloc(sizeof(BOX));
 	unionT = (BOX *) palloc(sizeof(BOX));
 
@@ -485,12 +446,6 @@ gist_box_picksplit(PG_FUNCTION_ARGS)
 			}
 			else
 				ADDLIST(listT, unionT, posT, i);
-		}
-
-		if (IS_BADRATIO(posR, posL) && IS_BADRATIO(posT, posB))
-		{
-			fallbackSplit(entryvec, v);
-			PG_RETURN_POINTER(v);
 		}
 	}
 
@@ -768,19 +723,13 @@ gist_poly_consistent(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	POLYGON    *query = PG_GETARG_POLYGON_P(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
-	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	bool		result;
-
-	/* All cases served by this function are inexact */
-	*recheck = true;
 
 	if (DatumGetBoxP(entry->key) == NULL || query == NULL)
 		PG_RETURN_BOOL(FALSE);
 
 	/*
-	 * Since the operators require recheck anyway, we can just use
+	 * Since the operators are marked lossy anyway, we can just use
 	 * rtree_internal_consistent even at leaf nodes.  (This works in part
 	 * because the index entries are bounding boxes not polygons.)
 	 */
@@ -845,20 +794,14 @@ gist_circle_consistent(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	CIRCLE	   *query = PG_GETARG_CIRCLE_P(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
-	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	BOX			bbox;
 	bool		result;
-
-	/* All cases served by this function are inexact */
-	*recheck = true;
 
 	if (DatumGetBoxP(entry->key) == NULL || query == NULL)
 		PG_RETURN_BOOL(FALSE);
 
 	/*
-	 * Since the operators require recheck anyway, we can just use
+	 * Since the operators are marked lossy anyway, we can just use
 	 * rtree_internal_consistent even at leaf nodes.  (This works in part
 	 * because the index entries are bounding boxes not circles.)
 	 */

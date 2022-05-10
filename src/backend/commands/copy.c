@@ -3,12 +3,12 @@
  * copy.c
  *		Implements the COPY utility command
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/copy.c,v 1.312 2009/06/11 14:48:55 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/copy.c,v 1.295 2008/01/01 19:45:48 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -40,7 +40,6 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "utils/snapmgr.h"
 
 
 #define ISOCTAL(c) (((c) >= '0') && ((c) <= '7'))
@@ -177,11 +176,8 @@ typedef struct
  * They are macros because they often do continue/break control and to avoid
  * function call overhead in tight COPY loops.
  *
- * We must use "if (1)" because the usual "do {...} while(0)" wrapper would
- * prevent the continue/break processing from working.	We end the "if (1)"
- * with "else ((void) 0)" to ensure the "if" does not unintentionally match
- * any "else" in the calling code, and to avoid any compiler warnings about
- * empty statements.  See http://www.cit.gu.edu.au/~anthony/info/C/C.macros.
+ * We must use "if (1)" because "do {} while(0)" overrides the continue/break
+ * processing.	See http://www.cit.gu.edu.au/~anthony/info/C/C.macros.
  */
 
 /*
@@ -197,7 +193,8 @@ if (1) \
 		need_data = true; \
 		continue; \
 	} \
-} else ((void) 0)
+} else
+
 
 /* This consumes the remainder of the buffer and breaks */
 #define IF_NEED_REFILL_AND_EOF_BREAK(extralen) \
@@ -211,7 +208,8 @@ if (1) \
 		result = true; \
 		break; \
 	} \
-} else ((void) 0)
+} else
+
 
 /*
  * Transfer any approved data to line_buf; must do this to be sure
@@ -227,7 +225,7 @@ if (1) \
 							   raw_buf_ptr - cstate->raw_buf_index); \
 		cstate->raw_buf_index = raw_buf_ptr; \
 	} \
-} else ((void) 0)
+} else
 
 /* Undo any read-ahead and jump out of the block. */
 #define NO_END_OF_COPY_GOTO \
@@ -235,7 +233,8 @@ if (1) \
 { \
 	raw_buf_ptr = prev_raw_ptr + 1; \
 	goto not_end_of_copy; \
-} else ((void) 0)
+} else
+
 
 static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
 
@@ -711,7 +710,7 @@ CopyLoadRawBuf(CopyState cstate)
  * or write to a file.
  *
  * Do not allow the copy if user doesn't have proper permission to access
- * the table or the specifically requested columns.
+ * the table.
  */
 uint64
 DoCopy(const CopyStmt *stmt, const char *queryString)
@@ -723,8 +722,7 @@ DoCopy(const CopyStmt *stmt, const char *queryString)
 	List	   *force_quote = NIL;
 	List	   *force_notnull = NIL;
 	AclMode		required_access = (is_from ? ACL_INSERT : ACL_SELECT);
-	AclMode		relPerms;
-	AclMode		remainingPerms;
+	AclResult	aclresult;
 	ListCell   *option;
 	TupleDesc	tupDesc;
 	int			num_phys_attrs;
@@ -855,11 +853,11 @@ DoCopy(const CopyStmt *stmt, const char *queryString)
 			cstate->escape = cstate->quote;
 	}
 
-	/* Only single-byte delimiter strings are supported. */
+	/* Only single-character delimiter strings are supported. */
 	if (strlen(cstate->delim) != 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			  errmsg("COPY delimiter must be a single one-byte character")));
+				 errmsg("COPY delimiter must be a single ASCII character")));
 
 	/* Disallow end-of-line characters */
 	if (strchr(cstate->delim, '\r') != NULL ||
@@ -879,8 +877,8 @@ DoCopy(const CopyStmt *stmt, const char *queryString)
 	 * backslash because it would be ambiguous.  We can't allow the other
 	 * cases because data characters matching the delimiter must be
 	 * backslashed, and certain backslash combinations are interpreted
-	 * non-literally by COPY IN.  Disallowing all lower case ASCII letters is
-	 * more than strictly necessary, but seems best for consistency and
+	 * non-literally by COPY IN.  Disallowing all lower case ASCII letters
+	 * is more than strictly necessary, but seems best for consistency and
 	 * future-proofing.  Likewise we disallow all digits though only octal
 	 * digits are actually dangerous.
 	 */
@@ -906,7 +904,7 @@ DoCopy(const CopyStmt *stmt, const char *queryString)
 	if (cstate->csv_mode && strlen(cstate->quote) != 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("COPY quote must be a single one-byte character")));
+				 errmsg("COPY quote must be a single ASCII character")));
 
 	if (cstate->csv_mode && cstate->delim[0] == cstate->quote[0])
 		ereport(ERROR,
@@ -922,7 +920,7 @@ DoCopy(const CopyStmt *stmt, const char *queryString)
 	if (cstate->csv_mode && strlen(cstate->escape) != 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("COPY escape must be a single one-byte character")));
+				 errmsg("COPY escape must be a single ASCII character")));
 
 	/* Check force_quote */
 	if (!cstate->csv_mode && force_quote != NIL)
@@ -974,34 +972,17 @@ DoCopy(const CopyStmt *stmt, const char *queryString)
 		cstate->rel = heap_openrv(stmt->relation,
 							 (is_from ? RowExclusiveLock : AccessShareLock));
 
-		tupDesc = RelationGetDescr(cstate->rel);
-
 		/* Check relation permissions. */
-		relPerms = pg_class_aclmask(RelationGetRelid(cstate->rel), GetUserId(),
-									required_access, ACLMASK_ALL);
-		remainingPerms = required_access & ~relPerms;
-		if (remainingPerms != 0)
-		{
-			/* We don't have table permissions, check per-column permissions */
-			List	   *attnums;
-			ListCell   *cur;
-
-			attnums = CopyGetAttnums(tupDesc, cstate->rel, attnamelist);
-			foreach(cur, attnums)
-			{
-				int			attnum = lfirst_int(cur);
-
-				if (pg_attribute_aclcheck(RelationGetRelid(cstate->rel),
-										  attnum,
-										  GetUserId(),
-										  remainingPerms) != ACLCHECK_OK)
-					aclcheck_error(ACLCHECK_NO_PRIV, ACL_KIND_CLASS,
-								   RelationGetRelationName(cstate->rel));
-			}
-		}
+		aclresult = pg_class_aclcheck(RelationGetRelid(cstate->rel),
+									  GetUserId(),
+									  required_access);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, ACL_KIND_CLASS,
+						   RelationGetRelationName(cstate->rel));
 
 		/* check read-only transaction */
-		if (XactReadOnly && is_from && !cstate->rel->rd_islocaltemp)
+		if (XactReadOnly && is_from &&
+			!isTempNamespace(RelationGetNamespace(cstate->rel)))
 			ereport(ERROR,
 					(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
 					 errmsg("transaction is read-only")));
@@ -1012,6 +993,8 @@ DoCopy(const CopyStmt *stmt, const char *queryString)
 					(errcode(ERRCODE_UNDEFINED_COLUMN),
 					 errmsg("table \"%s\" does not have OIDs",
 							RelationGetRelationName(cstate->rel))));
+
+		tupDesc = RelationGetDescr(cstate->rel);
 	}
 	else
 	{
@@ -1060,19 +1043,21 @@ DoCopy(const CopyStmt *stmt, const char *queryString)
 		plan = planner(query, 0, NULL);
 
 		/*
-		 * Use a snapshot with an updated command ID to ensure this query sees
-		 * results of any previously executed queries.
+		 * Update snapshot command ID to ensure this query sees results of any
+		 * previously executed queries.  (It's a bit cheesy to modify
+		 * ActiveSnapshot without making a copy, but for the limited ways in
+		 * which COPY can be invoked, I think it's OK, because the active
+		 * snapshot shouldn't be shared with anything else anyway.)
 		 */
-		PushUpdatedSnapshot(GetActiveSnapshot());
+		ActiveSnapshot->curcid = GetCurrentCommandId(false);
 
 		/* Create dest receiver for COPY OUT */
-		dest = CreateDestReceiver(DestCopyOut);
+		dest = CreateDestReceiver(DestCopyOut, NULL);
 		((DR_copy *) dest)->cstate = cstate;
 
 		/* Create a QueryDesc requesting no output */
-		cstate->queryDesc = CreateQueryDesc(plan, queryString,
-											GetActiveSnapshot(),
-											InvalidSnapshot,
+		cstate->queryDesc = CreateQueryDesc(plan,
+											ActiveSnapshot, InvalidSnapshot,
 											dest, NULL, false);
 
 		/*
@@ -1175,7 +1160,6 @@ DoCopy(const CopyStmt *stmt, const char *queryString)
 		/* Close down the query and free resources. */
 		ExecutorEnd(cstate->queryDesc);
 		FreeQueryDesc(cstate->queryDesc);
-		PopActiveSnapshot();
 	}
 
 	/* Clean up storage (probably not really necessary) */
@@ -1405,7 +1389,7 @@ CopyTo(CopyState cstate)
 		values = (Datum *) palloc(num_phys_attrs * sizeof(Datum));
 		nulls = (bool *) palloc(num_phys_attrs * sizeof(bool));
 
-		scandesc = heap_beginscan(cstate->rel, GetActiveSnapshot(), 0, NULL);
+		scandesc = heap_beginscan(cstate->rel, ActiveSnapshot, 0, NULL);
 
 		while ((tuple = heap_getnext(scandesc, ForwardScanDirection)) != NULL)
 		{
@@ -1655,7 +1639,7 @@ CopyFrom(CopyState cstate)
 	int			i;
 	Oid			in_func_oid;
 	Datum	   *values;
-	bool	   *nulls;
+	char	   *nulls;
 	int			nfields;
 	char	  **field_strings;
 	bool		done = false;
@@ -1670,8 +1654,8 @@ CopyFrom(CopyState cstate)
 	MemoryContext oldcontext = CurrentMemoryContext;
 	ErrorContextCallback errcontext;
 	CommandId	mycid = GetCurrentCommandId(true);
-	int			hi_options = 0; /* start with default heap_insert options */
-	BulkInsertState bistate;
+	bool		use_wal = true; /* by default, use WAL logging */
+	bool		use_fsm = true; /* by default, use FSM for free space */
 
 	Assert(cstate->rel);
 
@@ -1724,9 +1708,9 @@ CopyFrom(CopyState cstate)
 	if (cstate->rel->rd_createSubid != InvalidSubTransactionId ||
 		cstate->rel->rd_newRelfilenodeSubid != InvalidSubTransactionId)
 	{
-		hi_options |= HEAP_INSERT_SKIP_FSM;
+		use_fsm = false;
 		if (!XLogArchivingActive())
-			hi_options |= HEAP_INSERT_SKIP_WAL;
+			use_wal = false;
 	}
 
 	if (pipe)
@@ -1889,7 +1873,7 @@ CopyFrom(CopyState cstate)
 	}
 
 	values = (Datum *) palloc(num_phys_attrs * sizeof(Datum));
-	nulls = (bool *) palloc(num_phys_attrs * sizeof(bool));
+	nulls = (char *) palloc(num_phys_attrs * sizeof(char));
 
 	/* create workspace for CopyReadAttributes results */
 	nfields = file_has_oids ? (attr_count + 1) : attr_count;
@@ -1902,8 +1886,6 @@ CopyFrom(CopyState cstate)
 	cstate->cur_lineno = 0;
 	cstate->cur_attname = NULL;
 	cstate->cur_attval = NULL;
-
-	bistate = GetBulkInsertState();
 
 	/* Set up callback to identify error line number */
 	errcontext.callback = copy_in_error_callback;
@@ -1935,7 +1917,7 @@ CopyFrom(CopyState cstate)
 
 		/* Initialize all values for row to NULL */
 		MemSet(values, 0, num_phys_attrs * sizeof(Datum));
-		MemSet(nulls, true, num_phys_attrs * sizeof(bool));
+		MemSet(nulls, 'n', num_phys_attrs * sizeof(char));
 
 		if (!cstate->binary)
 		{
@@ -2017,7 +1999,7 @@ CopyFrom(CopyState cstate)
 											  typioparams[m],
 											  attr[m]->atttypmod);
 				if (string != NULL)
-					nulls[m] = false;
+					nulls[m] = ' ';
 				cstate->cur_attname = NULL;
 				cstate->cur_attval = NULL;
 			}
@@ -2073,7 +2055,8 @@ CopyFrom(CopyState cstate)
 													&in_functions[m],
 													typioparams[m],
 													attr[m]->atttypmod,
-													&nulls[m]);
+													&isnull);
+				nulls[m] = isnull ? 'n' : ' ';
 				cstate->cur_attname = NULL;
 			}
 		}
@@ -2086,11 +2069,13 @@ CopyFrom(CopyState cstate)
 		for (i = 0; i < num_defaults; i++)
 		{
 			values[defmap[i]] = ExecEvalExpr(defexprs[i], econtext,
-											 &nulls[defmap[i]], NULL);
+											 &isnull, NULL);
+			if (!isnull)
+				nulls[defmap[i]] = ' ';
 		}
 
 		/* And now we can form the input tuple. */
-		tuple = heap_form_tuple(tupDesc, values, nulls);
+		tuple = heap_formtuple(tupDesc, values, nulls);
 
 		if (cstate->oids && file_has_oids)
 			HeapTupleSetOid(tuple, loaded_oid);
@@ -2127,7 +2112,7 @@ CopyFrom(CopyState cstate)
 				ExecConstraints(resultRelInfo, slot, estate);
 
 			/* OK, store the tuple and create index entries for it */
-			heap_insert(cstate->rel, tuple, mycid, hi_options, bistate);
+			heap_insert(cstate->rel, tuple, mycid, use_wal, use_fsm);
 
 			if (resultRelInfo->ri_NumIndices > 0)
 				ExecInsertIndexTuples(slot, &(tuple->t_self), estate, false);
@@ -2146,8 +2131,6 @@ CopyFrom(CopyState cstate)
 
 	/* Done, clean up */
 	error_context_stack = errcontext.previous;
-
-	FreeBulkInsertState(bistate);
 
 	MemoryContextSwitchTo(oldcontext);
 
@@ -2185,7 +2168,7 @@ CopyFrom(CopyState cstate)
 	 * If we skipped writing WAL, then we need to sync the heap (but not
 	 * indexes since those use WAL anyway)
 	 */
-	if (hi_options & HEAP_INSERT_SKIP_WAL)
+	if (!use_wal)
 		heap_sync(cstate->rel);
 }
 
@@ -2454,10 +2437,10 @@ CopyReadLineText(CopyState cstate)
 						ereport(ERROR,
 								(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 								 !cstate->csv_mode ?
-							errmsg("literal carriage return found in data") :
-							errmsg("unquoted carriage return found in data"),
+								 errmsg("literal carriage return found in data") :
+								 errmsg("unquoted carriage return found in data"),
 								 !cstate->csv_mode ?
-						errhint("Use \"\\r\" to represent carriage return.") :
+								 errhint("Use \"\\r\" to represent carriage return.") :
 								 errhint("Use quoted CSV field to represent carriage return.")));
 
 					/*
@@ -2474,7 +2457,7 @@ CopyReadLineText(CopyState cstate)
 						 errmsg("literal carriage return found in data") :
 						 errmsg("unquoted carriage return found in data"),
 						 !cstate->csv_mode ?
-					   errhint("Use \"\\r\" to represent carriage return.") :
+						 errhint("Use \"\\r\" to represent carriage return.") :
 						 errhint("Use quoted CSV field to represent carriage return.")));
 			/* If reach here, we have found the line terminator */
 			break;
@@ -2491,7 +2474,7 @@ CopyReadLineText(CopyState cstate)
 						 errmsg("unquoted newline found in data"),
 						 !cstate->csv_mode ?
 						 errhint("Use \"\\n\" to represent newline.") :
-					 errhint("Use quoted CSV field to represent newline.")));
+						 errhint("Use quoted CSV field to represent newline.")));
 			cstate->eol_type = EOL_NL;	/* in case not set yet */
 			/* If reach here, we have found the line terminator */
 			break;
@@ -2718,7 +2701,7 @@ CopyReadAttributesText(CopyState cstate, int maxfields, char **fieldvals)
 		char	   *start_ptr;
 		char	   *end_ptr;
 		int			input_len;
-		bool		saw_non_ascii = false;
+		bool		saw_high_bit = false;
 
 		/* Make sure space remains in fieldvals[] */
 		if (fieldno >= maxfields)
@@ -2783,8 +2766,8 @@ CopyReadAttributesText(CopyState cstate, int maxfields, char **fieldvals)
 								}
 							}
 							c = val & 0377;
-							if (c == '\0' || IS_HIGHBIT_SET(c))
-								saw_non_ascii = true;
+							if (IS_HIGHBIT_SET(c))
+								saw_high_bit = true;
 						}
 						break;
 					case 'x':
@@ -2808,8 +2791,8 @@ CopyReadAttributesText(CopyState cstate, int maxfields, char **fieldvals)
 									}
 								}
 								c = val & 0xff;
-								if (c == '\0' || IS_HIGHBIT_SET(c))
-									saw_non_ascii = true;
+								if (IS_HIGHBIT_SET(c))
+									saw_high_bit = true;
 							}
 						}
 						break;
@@ -2847,11 +2830,11 @@ CopyReadAttributesText(CopyState cstate, int maxfields, char **fieldvals)
 		*output_ptr++ = '\0';
 
 		/*
-		 * If we de-escaped a non-7-bit-ASCII char, make sure we still have
-		 * valid data for the db encoding. Avoid calling strlen here for the
-		 * sake of efficiency.
+		 * If we de-escaped a char with the high bit set, make sure we still
+		 * have valid data for the db encoding. Avoid calling strlen here for
+		 * the sake of efficiency.
 		 */
-		if (saw_non_ascii)
+		if (saw_high_bit)
 		{
 			char	   *fld = fieldvals[fieldno];
 
@@ -2930,6 +2913,7 @@ CopyReadAttributesCSV(CopyState cstate, int maxfields, char **fieldvals)
 	for (;;)
 	{
 		bool		found_delim = false;
+		bool		in_quote = false;
 		bool		saw_quote = false;
 		char	   *start_ptr;
 		char	   *end_ptr;
@@ -2945,87 +2929,71 @@ CopyReadAttributesCSV(CopyState cstate, int maxfields, char **fieldvals)
 		start_ptr = cur_ptr;
 		fieldvals[fieldno] = output_ptr;
 
-		/*
-		 * Scan data for field,
-		 *
-		 * The loop starts in "not quote" mode and then toggles between that
-		 * and "in quote" mode. The loop exits normally if it is in "not
-		 * quote" mode and a delimiter or line end is seen.
-		 */
+		/* Scan data for field */
 		for (;;)
 		{
 			char		c;
 
-			/* Not in quote */
-			for (;;)
+			end_ptr = cur_ptr;
+			if (cur_ptr >= line_end_ptr)
+				break;
+			c = *cur_ptr++;
+			/* unquoted field delimiter */
+			if (c == delimc && !in_quote)
 			{
-				end_ptr = cur_ptr;
-				if (cur_ptr >= line_end_ptr)
-					goto endfield;
-				c = *cur_ptr++;
-				/* unquoted field delimiter */
-				if (c == delimc)
-				{
-					found_delim = true;
-					goto endfield;
-				}
-				/* start of quoted field (or part of field) */
-				if (c == quotec)
-				{
-					saw_quote = true;
-					break;
-				}
-				/* Add c to output string */
-				*output_ptr++ = c;
+				found_delim = true;
+				break;
 			}
-
-			/* In quote */
-			for (;;)
+			/* start of quoted field (or part of field) */
+			if (c == quotec && !in_quote)
 			{
-				end_ptr = cur_ptr;
-				if (cur_ptr >= line_end_ptr)
-					ereport(ERROR,
-							(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-							 errmsg("unterminated CSV quoted field")));
-
-				c = *cur_ptr++;
-
-				/* escape within a quoted field */
-				if (c == escapec)
+				saw_quote = true;
+				in_quote = true;
+				continue;
+			}
+			/* escape within a quoted field */
+			if (c == escapec && in_quote)
+			{
+				/*
+				 * peek at the next char if available, and escape it if it is
+				 * an escape char or a quote char
+				 */
+				if (cur_ptr < line_end_ptr)
 				{
-					/*
-					 * peek at the next char if available, and escape it if it
-					 * is an escape char or a quote char
-					 */
-					if (cur_ptr < line_end_ptr)
-					{
-						char		nextc = *cur_ptr;
+					char		nextc = *cur_ptr;
 
-						if (nextc == escapec || nextc == quotec)
-						{
-							*output_ptr++ = nextc;
-							cur_ptr++;
-							continue;
-						}
+					if (nextc == escapec || nextc == quotec)
+					{
+						*output_ptr++ = nextc;
+						cur_ptr++;
+						continue;
 					}
 				}
-
-				/*
-				 * end of quoted field. Must do this test after testing for
-				 * escape in case quote char and escape char are the same
-				 * (which is the common case).
-				 */
-				if (c == quotec)
-					break;
-
-				/* Add c to output string */
-				*output_ptr++ = c;
 			}
+
+			/*
+			 * end of quoted field. Must do this test after testing for escape
+			 * in case quote char and escape char are the same (which is the
+			 * common case).
+			 */
+			if (c == quotec && in_quote)
+			{
+				in_quote = false;
+				continue;
+			}
+
+			/* Add c to output string */
+			*output_ptr++ = c;
 		}
-endfield:
 
 		/* Terminate attribute value in output area */
 		*output_ptr++ = '\0';
+
+		/* Shouldn't still be in quote mode */
+		if (in_quote)
+			ereport(ERROR,
+					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
+					 errmsg("unterminated CSV quoted field")));
 
 		/* Check whether raw input matched null marker */
 		input_len = end_ptr - start_ptr;
@@ -3145,11 +3113,11 @@ CopyAttributeOutText(CopyState cstate, char *string)
 			if ((unsigned char) c < (unsigned char) 0x20)
 			{
 				/*
-				 * \r and \n must be escaped, the others are traditional. We
-				 * prefer to dump these using the C-like notation, rather than
-				 * a backslash and the literal character, because it makes the
-				 * dump file a bit more proof against Microsoftish data
-				 * mangling.
+				 * \r and \n must be escaped, the others are traditional.
+				 * We prefer to dump these using the C-like notation, rather
+				 * than a backslash and the literal character, because it
+				 * makes the dump file a bit more proof against Microsoftish
+				 * data mangling.
 				 */
 				switch (c)
 				{
@@ -3183,7 +3151,7 @@ CopyAttributeOutText(CopyState cstate, char *string)
 				DUMPSOFAR();
 				CopySendChar(cstate, '\\');
 				CopySendChar(cstate, c);
-				start = ++ptr;	/* do not include char in next run */
+				start = ++ptr;			/* do not include char in next run */
 			}
 			else if (c == '\\' || c == delimc)
 			{
@@ -3205,11 +3173,11 @@ CopyAttributeOutText(CopyState cstate, char *string)
 			if ((unsigned char) c < (unsigned char) 0x20)
 			{
 				/*
-				 * \r and \n must be escaped, the others are traditional. We
-				 * prefer to dump these using the C-like notation, rather than
-				 * a backslash and the literal character, because it makes the
-				 * dump file a bit more proof against Microsoftish data
-				 * mangling.
+				 * \r and \n must be escaped, the others are traditional.
+				 * We prefer to dump these using the C-like notation, rather
+				 * than a backslash and the literal character, because it
+				 * makes the dump file a bit more proof against Microsoftish
+				 * data mangling.
 				 */
 				switch (c)
 				{
@@ -3243,7 +3211,7 @@ CopyAttributeOutText(CopyState cstate, char *string)
 				DUMPSOFAR();
 				CopySendChar(cstate, '\\');
 				CopySendChar(cstate, c);
-				start = ++ptr;	/* do not include char in next run */
+				start = ++ptr;			/* do not include char in next run */
 			}
 			else if (c == '\\' || c == delimc)
 			{

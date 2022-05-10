@@ -4,89 +4,57 @@
  *	  page utilities routines for the postgres inverted index access method.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *			$PostgreSQL: pgsql/src/backend/access/gin/ginentrypage.c,v 1.21.2.1 2009/10/02 21:14:11 tgl Exp $
+ *			$PostgreSQL: pgsql/src/backend/access/gin/ginentrypage.c,v 1.12 2008/01/01 19:45:46 momjian Exp $
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
-
 #include "access/gin.h"
-#include "storage/bufmgr.h"
-#include "utils/rel.h"
+#include "access/tuptoaster.h"
 
 /*
- * Form a tuple for entry tree.
- *
- * If the tuple would be too big to be stored, function throws a suitable
- * error if errorTooBig is TRUE, or returns NULL if errorTooBig is FALSE.
- *
- * On leaf pages, Index tuple has non-traditional layout. Tuple may contain
- * posting list or root blocknumber of posting tree.
- * Macros: GinIsPostingTree(itup) / GinSetPostingTree(itup, blkno)
+ * forms tuple for entry tree. On leaf page, Index tuple has
+ * non-traditional layout. Tuple may contain posting list or
+ * root blocknumber of posting tree. Macros GinIsPostingTre: (itup) / GinSetPostingTree(itup, blkno)
  * 1) Posting list
- *		- itup->t_info & INDEX_SIZE_MASK contains total size of tuple as usual
+ *		- itup->t_info & INDEX_SIZE_MASK contains size of tuple as usual
  *		- ItemPointerGetBlockNumber(&itup->t_tid) contains original
  *		  size of tuple (without posting list).
- *		  Macros: GinGetOrigSizePosting(itup) / GinSetOrigSizePosting(itup,n)
+ *		  Macroses: GinGetOrigSizePosting(itup) / GinSetOrigSizePosting(itup,n)
  *		- ItemPointerGetOffsetNumber(&itup->t_tid) contains number
- *		  of elements in posting list (number of heap itempointers)
- *		  Macros: GinGetNPosting(itup) / GinSetNPosting(itup,n)
- *		- After standard part of tuple there is a posting list, ie, array
- *		  of heap itempointers
+ *		  of elements in posting list (number of heap itempointer)
+ *		  Macroses: GinGetNPosting(itup) / GinSetNPosting(itup,n)
+ *		- After usual part of tuple there is a posting list
  *		  Macros: GinGetPosting(itup)
  * 2) Posting tree
  *		- itup->t_info & INDEX_SIZE_MASK contains size of tuple as usual
  *		- ItemPointerGetBlockNumber(&itup->t_tid) contains block number of
  *		  root of posting tree
- *		- ItemPointerGetOffsetNumber(&itup->t_tid) contains magic number
- *		  GIN_TREE_POSTING, which distinguishes this from posting-list case
- *
- * Attributes of an index tuple are different for single and multicolumn index.
- * For single-column case, index tuple stores only value to be indexed.
- * For multicolumn case, it stores two attributes: column number of value
- * and value.
+ *		- ItemPointerGetOffsetNumber(&itup->t_tid) contains magic number GIN_TREE_POSTING
  */
 IndexTuple
-GinFormTuple(Relation index, GinState *ginstate,
-			 OffsetNumber attnum, Datum key,
-			 ItemPointerData *ipd, uint32 nipd, bool errorTooBig)
+GinFormTuple(GinState *ginstate, Datum key, ItemPointerData *ipd, uint32 nipd)
 {
-	bool		isnull[2] = {FALSE, FALSE};
+	bool		isnull = FALSE;
 	IndexTuple	itup;
-	uint32		newsize;
 
-	if (ginstate->oneCol)
-		itup = index_form_tuple(ginstate->origTupdesc, &key, isnull);
-	else
-	{
-		Datum		datums[2];
-
-		datums[0] = UInt16GetDatum(attnum);
-		datums[1] = key;
-		itup = index_form_tuple(ginstate->tupdesc[attnum - 1], datums, isnull);
-	}
+	itup = index_form_tuple(ginstate->tupdesc, &key, &isnull);
 
 	GinSetOrigSizePosting(itup, IndexTupleSize(itup));
 
 	if (nipd > 0)
 	{
-		newsize = MAXALIGN(SHORTALIGN(IndexTupleSize(itup)) + sizeof(ItemPointerData) * nipd);
-		if (newsize > Min(INDEX_SIZE_MASK, GinMaxItemSize))
-		{
-			if (errorTooBig)
-				ereport(ERROR,
-						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("index row size %lu exceeds maximum %lu for index \"%s\"",
-								(unsigned long) newsize,
-								(unsigned long) Min(INDEX_SIZE_MASK,
-													GinMaxItemSize),
-								RelationGetRelationName(index))));
+		uint32		newsize = MAXALIGN(SHORTALIGN(IndexTupleSize(itup)) + sizeof(ItemPointerData) * nipd);
+
+		if (newsize >= INDEX_SIZE_MASK)
 			return NULL;
-		}
+
+		if (newsize > TOAST_INDEX_TARGET && nipd > 1)
+			return NULL;
 
 		itup = repalloc(itup, newsize);
 
@@ -100,54 +68,9 @@ GinFormTuple(Relation index, GinState *ginstate,
 	}
 	else
 	{
-		/*
-		 * Gin tuple without any ItemPointers should be large enough to keep
-		 * one ItemPointer, to prevent inconsistency between
-		 * ginHeapTupleFastCollect and ginEntryInsert called by
-		 * ginHeapTupleInsert.  ginHeapTupleFastCollect forms tuple without
-		 * extra pointer to heap, but ginEntryInsert (called for pending list
-		 * cleanup during vacuum) will form the same tuple with one
-		 * ItemPointer.
-		 */
-		newsize = MAXALIGN(SHORTALIGN(IndexTupleSize(itup)) + sizeof(ItemPointerData));
-		if (newsize > Min(INDEX_SIZE_MASK, GinMaxItemSize))
-		{
-			if (errorTooBig)
-				ereport(ERROR,
-						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("index row size %lu exceeds maximum %lu for index \"%s\"",
-								(unsigned long) newsize,
-								(unsigned long) Min(INDEX_SIZE_MASK,
-													GinMaxItemSize),
-								RelationGetRelationName(index))));
-			return NULL;
-		}
-
 		GinSetNPosting(itup, 0);
 	}
 	return itup;
-}
-
-/*
- * Sometimes we reduce the number of posting list items in a tuple after
- * having built it with GinFormTuple.  This function adjusts the size
- * fields to match.
- */
-void
-GinShortenTuple(IndexTuple itup, uint32 nipd)
-{
-	uint32		newsize;
-
-	Assert(nipd <= GinGetNPosting(itup));
-
-	newsize = MAXALIGN(SHORTALIGN(GinGetOrigSizePosting(itup)) + sizeof(ItemPointerData) * nipd);
-
-	Assert(newsize <= (itup->t_info & INDEX_SIZE_MASK));
-
-	itup->t_info &= ~INDEX_SIZE_MASK;
-	itup->t_info |= newsize;
-
-	GinSetNPosting(itup, nipd);
 }
 
 /*
@@ -162,20 +85,28 @@ getRightMostTuple(Page page)
 	return (IndexTuple) PageGetItem(page, PageGetItemId(page, maxoff));
 }
 
+Datum
+ginGetHighKey(GinState *ginstate, Page page)
+{
+	IndexTuple	itup;
+	bool		isnull;
+
+	itup = getRightMostTuple(page);
+
+	return index_getattr(itup, FirstOffsetNumber, ginstate->tupdesc, &isnull);
+}
+
 static bool
 entryIsMoveRight(GinBtree btree, Page page)
 {
-	IndexTuple	itup;
+	Datum		highkey;
 
 	if (GinPageRightMost(page))
 		return FALSE;
 
-	itup = getRightMostTuple(page);
+	highkey = ginGetHighKey(btree->ginstate, page);
 
-	if (compareAttEntries(btree->ginstate,
-						  btree->entryAttnum, btree->entryValue,
-						  gintuple_get_attrnum(btree->ginstate, itup),
-						  gin_index_getattr(btree->ginstate, itup)) > 0)
+	if (compareEntries(btree->ginstate, btree->entryValue, highkey) > 0)
 		return TRUE;
 
 	return FALSE;
@@ -220,11 +151,11 @@ entryLocateEntry(GinBtree btree, GinBtreeStack *stack)
 			result = -1;
 		else
 		{
+			bool		isnull;
+
 			itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, mid));
-			result = compareAttEntries(btree->ginstate,
-									   btree->entryAttnum, btree->entryValue,
-								 gintuple_get_attrnum(btree->ginstate, itup),
-								   gin_index_getattr(btree->ginstate, itup));
+			result = compareEntries(btree->ginstate, btree->entryValue,
+									index_getattr(itup, FirstOffsetNumber, btree->ginstate->tupdesc, &isnull));
 		}
 
 		if (result == 0)
@@ -283,13 +214,13 @@ entryLocateLeafEntry(GinBtree btree, GinBtreeStack *stack)
 	while (high > low)
 	{
 		OffsetNumber mid = low + ((high - low) / 2);
+		bool		isnull;
 		int			result;
 
 		itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, mid));
-		result = compareAttEntries(btree->ginstate,
-								   btree->entryAttnum, btree->entryValue,
-								 gintuple_get_attrnum(btree->ginstate, itup),
-								   gin_index_getattr(btree->ginstate, itup));
+		result = compareEntries(btree->ginstate, btree->entryValue,
+								index_getattr(itup, FirstOffsetNumber, btree->ginstate->tupdesc, &isnull));
+
 		if (result == 0)
 		{
 			stack->off = mid;
@@ -519,7 +450,7 @@ entrySplitPage(GinBtree btree, Buffer lbuf, Buffer rbuf, OffsetNumber off, XLogR
 				leftrightmost = NULL;
 	static ginxlogSplit data;
 	Page		page;
-	Page		lpage = PageGetTempPageCopy(BufferGetPage(lbuf));
+	Page		lpage = GinPageGetCopyPage(BufferGetPage(lbuf));
 	Page		rpage = BufferGetPage(rbuf);
 	Size		pageSize = PageGetPageSize(lpage);
 
@@ -653,7 +584,7 @@ entryFillRoot(GinBtree btree, Buffer root, Buffer lbuf, Buffer rbuf)
 }
 
 void
-prepareEntryScan(GinBtree btree, Relation index, OffsetNumber attnum, Datum value, GinState *ginstate)
+prepareEntryScan(GinBtree btree, Relation index, Datum value, GinState *ginstate)
 {
 	memset(btree, 0, sizeof(GinBtreeData));
 
@@ -669,7 +600,6 @@ prepareEntryScan(GinBtree btree, Relation index, OffsetNumber attnum, Datum valu
 
 	btree->index = index;
 	btree->ginstate = ginstate;
-	btree->entryAttnum = attnum;
 	btree->entryValue = value;
 
 	btree->isDelete = FALSE;

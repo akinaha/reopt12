@@ -5,12 +5,12 @@
  *
  * See src/backend/access/transam/README for more information.
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/transam/xact.c,v 1.274.2.3 2010/01/24 21:49:31 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/access/transam/xact.c,v 1.257 2008/01/15 18:56:59 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -26,9 +26,7 @@
 #include "access/twophase.h"
 #include "access/xact.h"
 #include "access/xlogutils.h"
-#include "catalog/catalog.h"
 #include "catalog/namespace.h"
-#include "catalog/storage.h"
 #include "commands/async.h"
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
@@ -36,7 +34,6 @@
 #include "libpq/be-fsstubs.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
@@ -48,8 +45,7 @@
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/relcache.h"
-#include "utils/snapmgr.h"
-#include "pg_trace.h"
+#include "utils/xml.h"
 
 
 /*
@@ -65,13 +61,6 @@ bool		XactSyncCommit = true;
 
 int			CommitDelay = 0;	/* precommit delay in microseconds */
 int			CommitSiblings = 5; /* # concurrent xacts needed to sleep */
-
-/*
- * MyXactAccessedTempRel is set when a temporary relation is accessed.
- * We don't allow PREPARE TRANSACTION in that case.  (This is global
- * so that it can be set from heapam.c.)
- */
-bool		MyXactAccessedTempRel = false;
 
 
 /*
@@ -134,11 +123,9 @@ typedef struct TransactionStateData
 	int			gucNestLevel;	/* GUC context nesting depth */
 	MemoryContext curTransactionContext;		/* my xact-lifetime context */
 	ResourceOwner curTransactionOwner;	/* my query resources */
-	TransactionId *childXids;	/* subcommitted child XIDs, in XID order */
-	int			nChildXids;		/* # of subcommitted child XIDs */
-	int			maxChildXids;	/* allocated size of childXids[] */
+	List	   *childXids;		/* subcommitted child XIDs */
 	Oid			prevUser;		/* previous CurrentUserId setting */
-	int			prevSecContext;	/* previous SecurityRestrictionContext */
+	bool		prevSecDefCxt;	/* previous SecurityDefinerContext setting */
 	bool		prevXactReadOnly;		/* entry-time xact r/o state */
 	struct TransactionStateData *parent;		/* back link to parent */
 } TransactionStateData;
@@ -162,11 +149,9 @@ static TransactionStateData TopTransactionStateData = {
 	0,							/* GUC context nesting depth */
 	NULL,						/* cur transaction context */
 	NULL,						/* cur transaction resource owner */
-	NULL,						/* subcommitted child Xids */
-	0,							/* # of subcommitted child Xids */
-	0,							/* allocated size of childXids[] */
+	NIL,						/* subcommitted child Xids */
 	InvalidOid,					/* previous CurrentUserId setting */
-	0,							/* previous SecurityRestrictionContext */
+	false,						/* previous SecurityDefinerContext setting */
 	false,						/* entry-time xact r/o state */
 	NULL						/* link to parent state block */
 };
@@ -255,6 +240,7 @@ static void CommitTransaction(void);
 static TransactionId RecordTransactionAbort(bool isSubXact);
 static void StartTransaction(void);
 
+static void RecordSubTransactionCommit(void);
 static void StartSubTransaction(void);
 static void CommitSubTransaction(void);
 static void AbortSubTransaction(void);
@@ -456,7 +442,7 @@ GetCurrentSubTransactionId(void)
  *
  * "used" must be TRUE if the caller intends to use the command ID to mark
  * inserted/updated/deleted tuples.  FALSE means the ID is being fetched
- * for read-only purposes (ie, as a snapshot validity cutoff).	See
+ * for read-only purposes (ie, as a snapshot validity cutoff).  See
  * CommandCounterIncrement() for discussion.
  */
 CommandId
@@ -566,8 +552,7 @@ TransactionIdIsCurrentTransactionId(TransactionId xid)
 	 */
 	for (s = CurrentTransactionState; s != NULL; s = s->parent)
 	{
-		int			low,
-					high;
+		ListCell   *cell;
 
 		if (s->state == TRANS_ABORT)
 			continue;
@@ -575,22 +560,10 @@ TransactionIdIsCurrentTransactionId(TransactionId xid)
 			continue;			/* it can't have any child XIDs either */
 		if (TransactionIdEquals(xid, s->transactionId))
 			return true;
-		/* As the childXids array is ordered, we can use binary search */
-		low = 0;
-		high = s->nChildXids - 1;
-		while (low <= high)
+		foreach(cell, s->childXids)
 		{
-			int			middle;
-			TransactionId probe;
-
-			middle = low + (high - low) / 2;
-			probe = s->childXids[middle];
-			if (TransactionIdEquals(probe, xid))
+			if (TransactionIdEquals(xid, lfirst_xid(cell)))
 				return true;
-			else if (TransactionIdPrecedes(probe, xid))
-				low = middle + 1;
-			else
-				high = middle - 1;
 		}
 	}
 
@@ -605,31 +578,36 @@ void
 CommandCounterIncrement(void)
 {
 	/*
-	 * If the current value of the command counter hasn't been "used" to mark
-	 * tuples, we need not increment it, since there's no need to distinguish
-	 * a read-only command from others.  This helps postpone command counter
-	 * overflow, and keeps no-op CommandCounterIncrement operations cheap.
+	 * If the current value of the command counter hasn't been "used" to
+	 * mark tuples, we need not increment it, since there's no need to
+	 * distinguish a read-only command from others.  This helps postpone
+	 * command counter overflow, and keeps no-op CommandCounterIncrement
+	 * operations cheap.
 	 */
 	if (currentCommandIdUsed)
 	{
 		currentCommandId += 1;
-		if (currentCommandId == FirstCommandId) /* check for overflow */
+		if (currentCommandId == FirstCommandId)	/* check for overflow */
 		{
 			currentCommandId -= 1;
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("cannot have more than 2^32-1 commands in a transaction")));
+		  errmsg("cannot have more than 2^32-1 commands in a transaction")));
 		}
 		currentCommandIdUsed = false;
 
-		/* Propagate new command ID into static snapshots */
-		SnapshotSetCommandId(currentCommandId);
+		/* Propagate new command ID into static snapshots, if set */
+		if (SerializableSnapshot)
+			SerializableSnapshot->curcid = currentCommandId;
+		if (LatestSnapshot)
+			LatestSnapshot->curcid = currentCommandId;
 
 		/*
-		 * Make any catalog changes done by the just-completed command visible
-		 * in the local syscache.  We obviously don't need to do this after a
-		 * read-only command.  (But see hacks in inval.c to make real sure we
-		 * don't think a command that queued inval messages was read-only.)
+		 * Make any catalog changes done by the just-completed command
+		 * visible in the local syscache.  We obviously don't need to do
+		 * this after a read-only command.  (But see hacks in inval.c
+		 * to make real sure we don't think a command that queued inval
+		 * messages was read-only.)
 		 */
 		AtCommit_LocalCache();
 	}
@@ -637,11 +615,11 @@ CommandCounterIncrement(void)
 	/*
 	 * Make any other backends' catalog changes visible to me.
 	 *
-	 * XXX this is probably in the wrong place: CommandCounterIncrement should
-	 * be purely a local operation, most likely.  However fooling with this
-	 * will affect asynchronous cross-backend interactions, which doesn't seem
-	 * like a wise thing to do in late beta, so save improving this for
-	 * another day - tgl 2007-11-30
+	 * XXX this is probably in the wrong place: CommandCounterIncrement
+	 * should be purely a local operation, most likely.  However fooling
+	 * with this will affect asynchronous cross-backend interactions,
+	 * which doesn't seem like a wise thing to do in late beta, so save
+	 * improving this for another day - tgl 2007-11-30
 	 */
 	AtStart_Cache();
 }
@@ -951,7 +929,11 @@ RecordTransactionCommit(void)
 		 * Now we may update the CLOG, if we wrote a COMMIT record above
 		 */
 		if (markXidCommitted)
-			TransactionIdCommitTree(xid, nchildren, children);
+		{
+			TransactionIdCommit(xid);
+			/* to avoid race conditions, the parent must commit first */
+			TransactionIdCommitTree(nchildren, children);
+		}
 	}
 	else
 	{
@@ -969,7 +951,11 @@ RecordTransactionCommit(void)
 		 * flushed before the CLOG may be updated.
 		 */
 		if (markXidCommitted)
-			TransactionIdAsyncCommitTree(xid, nchildren, children, XactLastRecEnd);
+		{
+			TransactionIdAsyncCommit(xid, XactLastRecEnd);
+			/* to avoid race conditions, the parent must commit first */
+			TransactionIdAsyncCommitTree(nchildren, children, XactLastRecEnd);
+		}
 	}
 
 	/*
@@ -992,6 +978,8 @@ cleanup:
 	/* Clean up local data */
 	if (rels)
 		pfree(rels);
+	if (children)
+		pfree(children);
 
 	return latestXid;
 }
@@ -1072,79 +1060,64 @@ static void
 AtSubCommit_childXids(void)
 {
 	TransactionState s = CurrentTransactionState;
-	int			new_nChildXids;
+	MemoryContext old_cxt;
 
 	Assert(s->parent != NULL);
 
 	/*
-	 * The parent childXids array will need to hold my XID and all my
-	 * childXids, in addition to the XIDs already there.
+	 * We keep the child-XID lists in TopTransactionContext; this avoids
+	 * setting up child-transaction contexts for what might be just a few
+	 * bytes of grandchild XIDs.
 	 */
-	new_nChildXids = s->parent->nChildXids + s->nChildXids + 1;
+	old_cxt = MemoryContextSwitchTo(TopTransactionContext);
 
-	/* Allocate or enlarge the parent array if necessary */
-	if (s->parent->maxChildXids < new_nChildXids)
+	s->parent->childXids = lappend_xid(s->parent->childXids,
+									   s->transactionId);
+
+	if (s->childXids != NIL)
 	{
-		int			new_maxChildXids;
-		TransactionId *new_childXids;
+		s->parent->childXids = list_concat(s->parent->childXids,
+										   s->childXids);
 
 		/*
-		 * Make it 2x what's needed right now, to avoid having to enlarge it
-		 * repeatedly. But we can't go above MaxAllocSize.  (The latter limit
-		 * is what ensures that we don't need to worry about integer overflow
-		 * here or in the calculation of new_nChildXids.)
+		 * list_concat doesn't free the list header for the second list; do so
+		 * here to avoid memory leakage (kluge)
 		 */
-		new_maxChildXids = Min(new_nChildXids * 2,
-							   (int) (MaxAllocSize / sizeof(TransactionId)));
-
-		if (new_maxChildXids < new_nChildXids)
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("maximum number of committed subtransactions (%d) exceeded",
-							(int) (MaxAllocSize / sizeof(TransactionId)))));
-
-		/*
-		 * We keep the child-XID arrays in TopTransactionContext; this avoids
-		 * setting up child-transaction contexts for what might be just a few
-		 * bytes of grandchild XIDs.
-		 */
-		if (s->parent->childXids == NULL)
-			new_childXids =
-				MemoryContextAlloc(TopTransactionContext,
-								   new_maxChildXids * sizeof(TransactionId));
-		else
-			new_childXids = repalloc(s->parent->childXids,
-								   new_maxChildXids * sizeof(TransactionId));
-
-		s->parent->childXids = new_childXids;
-		s->parent->maxChildXids = new_maxChildXids;
+		pfree(s->childXids);
+		s->childXids = NIL;
 	}
 
+	MemoryContextSwitchTo(old_cxt);
+}
+
+/*
+ * RecordSubTransactionCommit
+ */
+static void
+RecordSubTransactionCommit(void)
+{
+	TransactionId xid = GetCurrentTransactionIdIfAny();
+
 	/*
-	 * Copy all my XIDs to parent's array.
+	 * We do not log the subcommit in XLOG; it doesn't matter until the
+	 * top-level transaction commits.
 	 *
-	 * Note: We rely on the fact that the XID of a child always follows that
-	 * of its parent.  By copying the XID of this subtransaction before the
-	 * XIDs of its children, we ensure that the array stays ordered.
-	 * Likewise, all XIDs already in the array belong to subtransactions
-	 * started and subcommitted before us, so their XIDs must precede ours.
+	 * We must mark the subtransaction subcommitted in the CLOG if it had a
+	 * valid XID assigned.	If it did not, nobody else will ever know about
+	 * the existence of this subxact.  We don't have to deal with deletions
+	 * scheduled for on-commit here, since they'll be reassigned to our parent
+	 * (who might still abort).
 	 */
-	s->parent->childXids[s->parent->nChildXids] = s->transactionId;
+	if (TransactionIdIsValid(xid))
+	{
+		/* XXX does this really need to be a critical section? */
+		START_CRIT_SECTION();
 
-	if (s->nChildXids > 0)
-		memcpy(&s->parent->childXids[s->parent->nChildXids + 1],
-			   s->childXids,
-			   s->nChildXids * sizeof(TransactionId));
+		/* Record subtransaction subcommit */
+		TransactionIdSubCommit(xid);
 
-	s->parent->nChildXids = new_nChildXids;
-
-	/* Release child's array to avoid leakage */
-	if (s->childXids != NULL)
-		pfree(s->childXids);
-	/* We must reset these to avoid double-free if fail later in commit */
-	s->childXids = NULL;
-	s->nChildXids = 0;
-	s->maxChildXids = 0;
+		END_CRIT_SECTION();
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -1249,8 +1222,14 @@ RecordTransactionAbort(bool isSubXact)
 	 * waiting for already-aborted subtransactions.  It is OK to do it without
 	 * having flushed the ABORT record to disk, because in event of a crash
 	 * we'd be assumed to have aborted anyway.
+	 *
+	 * The ordering here isn't critical but it seems best to mark the parent
+	 * first.  This assures an atomic transition of all the subtransactions to
+	 * aborted state from the point of view of concurrent
+	 * TransactionIdDidAbort calls.
 	 */
-	TransactionIdAbortTree(xid, nchildren, children);
+	TransactionIdAbort(xid);
+	TransactionIdAbortTree(nchildren, children);
 
 	END_CRIT_SECTION();
 
@@ -1273,6 +1252,8 @@ RecordTransactionAbort(bool isSubXact)
 	/* And clean up local data */
 	if (rels)
 		pfree(rels);
+	if (children)
+		pfree(children);
 
 	return latestXid;
 }
@@ -1344,15 +1325,12 @@ AtSubAbort_childXids(void)
 	TransactionState s = CurrentTransactionState;
 
 	/*
-	 * We keep the child-XID arrays in TopTransactionContext (see
-	 * AtSubCommit_childXids).	This means we'd better free the array
+	 * We keep the child-XID lists in TopTransactionContext (see
+	 * AtSubCommit_childXids).	This means we'd better free the list
 	 * explicitly at abort to avoid leakage.
 	 */
-	if (s->childXids != NULL)
-		pfree(s->childXids);
-	s->childXids = NULL;
-	s->nChildXids = 0;
-	s->maxChildXids = 0;
+	list_free(s->childXids);
+	s->childXids = NIL;
 }
 
 /* ----------------------------------------------------------------
@@ -1461,12 +1439,12 @@ StartTransaction(void)
 	s->transactionId = InvalidTransactionId;	/* until assigned */
 
 	/*
-	 * Make sure we've reset xact state variables
+	 * Make sure we've freed any old snapshot, and reset xact state variables
 	 */
+	FreeXactSnapshot();
 	XactIsoLevel = DefaultXactIsoLevel;
 	XactReadOnly = DefaultXactReadOnly;
 	forceSyncCommit = false;
-	MyXactAccessedTempRel = false;
 
 	/*
 	 * reinitialize within-transaction counters
@@ -1501,7 +1479,7 @@ StartTransaction(void)
 	Assert(MyProc->backendId == vxid.backendId);
 	MyProc->lxid = vxid.localTransactionId;
 
-	TRACE_POSTGRESQL_TRANSACTION_START(vxid.localTransactionId);
+	PG_TRACE1(transaction__start, vxid.localTransactionId);
 
 	/*
 	 * set transaction_timestamp() (a/k/a now()).  We want this to be the same
@@ -1520,12 +1498,10 @@ StartTransaction(void)
 	 */
 	s->nestingLevel = 1;
 	s->gucNestLevel = 1;
-	s->childXids = NULL;
-	s->nChildXids = 0;
-	s->maxChildXids = 0;
-	GetUserIdAndSecContext(&s->prevUser, &s->prevSecContext);
-	/* SecurityRestrictionContext should never be set outside a transaction */
-	Assert(s->prevSecContext == 0);
+	s->childXids = NIL;
+	GetUserIdAndContext(&s->prevUser, &s->prevSecDefCxt);
+	/* SecurityDefinerContext should never be set outside a transaction */
+	Assert(!s->prevSecDefCxt);
 
 	/*
 	 * initialize other subsystems for new transaction
@@ -1628,7 +1604,7 @@ CommitTransaction(void)
 	 */
 	latestXid = RecordTransactionCommit();
 
-	TRACE_POSTGRESQL_TRANSACTION_COMMIT(MyProc->lxid);
+	PG_TRACE1(transaction__commit, MyProc->lxid);
 
 	/*
 	 * Let others know about no transaction in progress by me. Note that this
@@ -1665,9 +1641,6 @@ CommitTransaction(void)
 	/* Clean up the relation cache */
 	AtEOXact_RelationCache(true);
 
-	/* Clean up the snapshot manager */
-	AtEarlyCommit_Snapshot();
-
 	/*
 	 * Make catalog changes visible to all backends.  This has to happen after
 	 * relcache references are dropped (see comments for
@@ -1699,6 +1672,7 @@ CommitTransaction(void)
 
 	AtEOXact_GUC(true, 1);
 	AtEOXact_SPI(true);
+	AtEOXact_xml();
 	AtEOXact_on_commit_actions(true);
 	AtEOXact_Namespace(true);
 	/* smgrcommit already done */
@@ -1706,7 +1680,6 @@ CommitTransaction(void)
 	AtEOXact_ComboCid();
 	AtEOXact_HashTables(true);
 	AtEOXact_PgStat(true);
-	AtEOXact_Snapshot(true);
 	pgstat_report_xact_timestamp(0);
 
 	CurrentResourceOwner = NULL;
@@ -1721,9 +1694,7 @@ CommitTransaction(void)
 	s->subTransactionId = InvalidSubTransactionId;
 	s->nestingLevel = 0;
 	s->gucNestLevel = 0;
-	s->childXids = NULL;
-	s->nChildXids = 0;
-	s->maxChildXids = 0;
+	s->childXids = NIL;
 
 	/*
 	 * done with commit processing, set current transaction state back to
@@ -1799,26 +1770,6 @@ PrepareTransaction(void)
 
 	/* NOTIFY and flatfiles will be handled below */
 
-	/*
-	 * Don't allow PREPARE TRANSACTION if we've accessed a temporary table in
-	 * this transaction.  Having the prepared xact hold locks on another
-	 * backend's temp table seems a bad idea --- for instance it would prevent
-	 * the backend from exiting.  There are other problems too, such as how to
-	 * clean up the source backend's local buffers and ON COMMIT state if the
-	 * prepared xact includes a DROP of a temp table.
-	 *
-	 * We must check this after executing any ON COMMIT actions, because they
-	 * might still access a temp relation.
-	 *
-	 * XXX In principle this could be relaxed to allow some useful special
-	 * cases, such as a temp table created and dropped all within the
-	 * transaction.  That seems to require much more bookkeeping though.
-	 */
-	if (MyXactAccessedTempRel)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot PREPARE a transaction that has operated on temporary tables")));
-
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();
 
@@ -1864,7 +1815,6 @@ PrepareTransaction(void)
 	AtPrepare_Inval();
 	AtPrepare_Locks();
 	AtPrepare_PgStat();
-	AtPrepare_MultiXact();
 
 	/*
 	 * Here is where we really truly prepare.
@@ -1907,9 +1857,6 @@ PrepareTransaction(void)
 	/* Clean up the relation cache */
 	AtEOXact_RelationCache(true);
 
-	/* Clean up the snapshot manager */
-	AtEarlyCommit_Snapshot();
-
 	/* notify and flatfiles don't need a postprepare call */
 
 	PostPrepare_PgStat();
@@ -1918,7 +1865,7 @@ PrepareTransaction(void)
 
 	PostPrepare_smgr();
 
-	PostPrepare_MultiXact(xid);
+	AtEOXact_MultiXact();
 
 	PostPrepare_Locks(xid);
 
@@ -1935,6 +1882,7 @@ PrepareTransaction(void)
 	/* PREPARE acts the same as COMMIT as far as GUC is concerned */
 	AtEOXact_GUC(true, 1);
 	AtEOXact_SPI(true);
+	AtEOXact_xml();
 	AtEOXact_on_commit_actions(true);
 	AtEOXact_Namespace(true);
 	/* smgrcommit already done */
@@ -1942,7 +1890,6 @@ PrepareTransaction(void)
 	AtEOXact_ComboCid();
 	AtEOXact_HashTables(true);
 	/* don't call AtEOXact_PgStat here */
-	AtEOXact_Snapshot(true);
 
 	CurrentResourceOwner = NULL;
 	ResourceOwnerDelete(TopTransactionResourceOwner);
@@ -1956,9 +1903,7 @@ PrepareTransaction(void)
 	s->subTransactionId = InvalidSubTransactionId;
 	s->nestingLevel = 0;
 	s->gucNestLevel = 0;
-	s->childXids = NULL;
-	s->nChildXids = 0;
-	s->maxChildXids = 0;
+	s->childXids = NIL;
 
 	/*
 	 * done with 1st phase commit processing, set current transaction state
@@ -2021,14 +1966,14 @@ AbortTransaction(void)
 	/*
 	 * Reset user ID which might have been changed transiently.  We need this
 	 * to clean up in case control escaped out of a SECURITY DEFINER function
-	 * or other local change of CurrentUserId; therefore, the prior value of
-	 * SecurityRestrictionContext also needs to be restored.
+	 * or other local change of CurrentUserId; therefore, the prior value
+	 * of SecurityDefinerContext also needs to be restored.
 	 *
 	 * (Note: it is not necessary to restore session authorization or role
 	 * settings here because those can only be changed via GUC, and GUC will
 	 * take care of rolling them back if need be.)
 	 */
-	SetUserIdAndSecContext(s->prevUser, s->prevSecContext);
+	SetUserIdAndContext(s->prevUser, s->prevSecDefCxt);
 
 	/*
 	 * do abort processing
@@ -2045,7 +1990,7 @@ AbortTransaction(void)
 	 */
 	latestXid = RecordTransactionAbort(false);
 
-	TRACE_POSTGRESQL_TRANSACTION_ABORT(MyProc->lxid);
+	PG_TRACE1(transaction__abort, MyProc->lxid);
 
 	/*
 	 * Let others know about no transaction in progress by me. Note that this
@@ -2056,40 +2001,38 @@ AbortTransaction(void)
 
 	/*
 	 * Post-abort cleanup.	See notes in CommitTransaction() concerning
-	 * ordering.  We can skip all of it if the transaction failed before
-	 * creating a resource owner.
+	 * ordering.
 	 */
-	if (TopTransactionResourceOwner != NULL)
-	{
-		CallXactCallbacks(XACT_EVENT_ABORT);
 
-		ResourceOwnerRelease(TopTransactionResourceOwner,
-							 RESOURCE_RELEASE_BEFORE_LOCKS,
-							 false, true);
-		AtEOXact_Buffers(false);
-		AtEOXact_RelationCache(false);
-		AtEOXact_Inval(false);
-		smgrDoPendingDeletes(false);
-		AtEOXact_MultiXact();
-		ResourceOwnerRelease(TopTransactionResourceOwner,
-							 RESOURCE_RELEASE_LOCKS,
-							 false, true);
-		ResourceOwnerRelease(TopTransactionResourceOwner,
-							 RESOURCE_RELEASE_AFTER_LOCKS,
-							 false, true);
-		AtEOXact_CatCache(false);
+	CallXactCallbacks(XACT_EVENT_ABORT);
 
-		AtEOXact_GUC(false, 1);
-		AtEOXact_SPI(false);
-		AtEOXact_on_commit_actions(false);
-		AtEOXact_Namespace(false);
-		AtEOXact_Files();
-		AtEOXact_ComboCid();
-		AtEOXact_HashTables(false);
-		AtEOXact_PgStat(false);
-		AtEOXact_Snapshot(false);
-		pgstat_report_xact_timestamp(0);
-	}
+	ResourceOwnerRelease(TopTransactionResourceOwner,
+						 RESOURCE_RELEASE_BEFORE_LOCKS,
+						 false, true);
+	AtEOXact_Buffers(false);
+	AtEOXact_RelationCache(false);
+	AtEOXact_Inval(false);
+	smgrDoPendingDeletes(false);
+	AtEOXact_MultiXact();
+	ResourceOwnerRelease(TopTransactionResourceOwner,
+						 RESOURCE_RELEASE_LOCKS,
+						 false, true);
+	ResourceOwnerRelease(TopTransactionResourceOwner,
+						 RESOURCE_RELEASE_AFTER_LOCKS,
+						 false, true);
+	AtEOXact_CatCache(false);
+
+	AtEOXact_GUC(false, 1);
+	AtEOXact_SPI(false);
+	AtEOXact_xml();
+	AtEOXact_on_commit_actions(false);
+	AtEOXact_Namespace(false);
+	smgrabort();
+	AtEOXact_Files();
+	AtEOXact_ComboCid();
+	AtEOXact_HashTables(false);
+	AtEOXact_PgStat(false);
+	pgstat_report_xact_timestamp(0);
 
 	/*
 	 * State remains TRANS_ABORT until CleanupTransaction().
@@ -2130,9 +2073,7 @@ CleanupTransaction(void)
 	s->subTransactionId = InvalidSubTransactionId;
 	s->nestingLevel = 0;
 	s->gucNestLevel = 0;
-	s->childXids = NULL;
-	s->nChildXids = 0;
-	s->maxChildXids = 0;
+	s->childXids = NIL;
 
 	/*
 	 * done with abort processing, set current transaction state back to
@@ -3752,11 +3693,8 @@ CommitSubTransaction(void)
 	/* Must CCI to ensure commands of subtransaction are seen as done */
 	CommandCounterIncrement();
 
-	/*
-	 * Prior to 8.4 we marked subcommit in clog at this point.	We now only
-	 * perform that step, if required, as part of the atomic update of the
-	 * whole transaction tree at top level commit or abort.
-	 */
+	/* Mark subtransaction as subcommitted */
+	RecordSubTransactionCommit();
 
 	/* Post-commit cleanup */
 	if (TransactionIdIsValid(s->transactionId))
@@ -3807,7 +3745,6 @@ CommitSubTransaction(void)
 					  s->parent->subTransactionId);
 	AtEOSubXact_HashTables(true, s->nestingLevel);
 	AtEOSubXact_PgStat(true, s->nestingLevel);
-	AtSubCommit_Snapshot(s->nestingLevel);
 
 	/*
 	 * We need to restore the upper transaction's read-only state, in case the
@@ -3871,10 +3808,10 @@ AbortSubTransaction(void)
 	s->state = TRANS_ABORT;
 
 	/*
-	 * Reset user ID which might have been changed transiently.  (See notes in
-	 * AbortTransaction.)
+	 * Reset user ID which might have been changed transiently.  (See notes
+	 * in AbortTransaction.)
 	 */
-	SetUserIdAndSecContext(s->prevUser, s->prevSecContext);
+	SetUserIdAndContext(s->prevUser, s->prevSecDefCxt);
 
 	/*
 	 * We can skip all this stuff if the subxact failed before creating a
@@ -3918,6 +3855,7 @@ AbortSubTransaction(void)
 
 		AtEOXact_GUC(false, s->gucNestLevel);
 		AtEOSubXact_SPI(false, s->subTransactionId);
+		AtEOXact_xml();
 		AtEOSubXact_on_commit_actions(false, s->subTransactionId,
 									  s->parent->subTransactionId);
 		AtEOSubXact_Namespace(false, s->subTransactionId,
@@ -3926,7 +3864,6 @@ AbortSubTransaction(void)
 						  s->parent->subTransactionId);
 		AtEOSubXact_HashTables(false, s->nestingLevel);
 		AtEOSubXact_PgStat(false, s->nestingLevel);
-		AtSubAbort_Snapshot(s->nestingLevel);
 	}
 
 	/*
@@ -4016,7 +3953,7 @@ PushTransaction(void)
 	s->savepointLevel = p->savepointLevel;
 	s->state = TRANS_DEFAULT;
 	s->blockState = TBLOCK_SUBBEGIN;
-	GetUserIdAndSecContext(&s->prevUser, &s->prevSecContext);
+	GetUserIdAndContext(&s->prevUser, &s->prevSecDefCxt);
 	s->prevXactReadOnly = XactReadOnly;
 
 	CurrentTransactionState = s;
@@ -4086,19 +4023,6 @@ ShowTransactionState(const char *str)
 static void
 ShowTransactionStateRec(TransactionState s)
 {
-	StringInfoData buf;
-
-	initStringInfo(&buf);
-
-	if (s->nChildXids > 0)
-	{
-		int			i;
-
-		appendStringInfo(&buf, "%u", s->childXids[0]);
-		for (i = 1; i < s->nChildXids; i++)
-			appendStringInfo(&buf, " %u", s->childXids[i]);
-	}
-
 	if (s->parent)
 		ShowTransactionStateRec(s->parent);
 
@@ -4112,9 +4036,8 @@ ShowTransactionStateRec(TransactionState s)
 							 (unsigned int) s->subTransactionId,
 							 (unsigned int) currentCommandId,
 							 currentCommandIdUsed ? " (used)" : "",
-							 s->nestingLevel, buf.data)));
-
-	pfree(buf.data);
+							 s->nestingLevel,
+							 nodeToString(s->childXids))));
 }
 
 /*
@@ -4193,22 +4116,36 @@ TransStateAsString(TransState state)
  * xactGetCommittedChildren
  *
  * Gets the list of committed children of the current transaction.	The return
- * value is the number of child transactions.  *ptr is set to point to an
- * array of TransactionIds.  The array is allocated in TopTransactionContext;
- * the caller should *not* pfree() it (this is a change from pre-8.4 code!).
- * If there are no subxacts, *ptr is set to NULL.
+ * value is the number of child transactions.  *children is set to point to a
+ * palloc'd array of TransactionIds.  If there are no subxacts, *children is
+ * set to NULL.
  */
 int
 xactGetCommittedChildren(TransactionId **ptr)
 {
 	TransactionState s = CurrentTransactionState;
+	int			nchildren;
+	TransactionId *children;
+	ListCell   *p;
 
-	if (s->nChildXids == 0)
+	nchildren = list_length(s->childXids);
+	if (nchildren == 0)
+	{
 		*ptr = NULL;
-	else
-		*ptr = s->childXids;
+		return 0;
+	}
 
-	return s->nChildXids;
+	children = (TransactionId *) palloc(nchildren * sizeof(TransactionId));
+	*ptr = children;
+
+	foreach(p, s->childXids)
+	{
+		TransactionId child = lfirst_xid(p);
+
+		*children++ = child;
+	}
+
+	return nchildren;
 }
 
 /*
@@ -4222,9 +4159,11 @@ xact_redo_commit(xl_xact_commit *xlrec, TransactionId xid)
 	TransactionId max_xid;
 	int			i;
 
-	/* Mark the transaction committed in pg_clog */
+	TransactionIdCommit(xid);
+
+	/* Mark committed subtransactions as committed */
 	sub_xids = (TransactionId *) &(xlrec->xnodes[xlrec->nrels]);
-	TransactionIdCommitTree(xid, xlrec->nsubxacts, sub_xids);
+	TransactionIdCommitTree(xlrec->nsubxacts, sub_xids);
 
 	/* Make sure nextXid is beyond any XID mentioned in the record */
 	max_xid = xid;
@@ -4243,18 +4182,8 @@ xact_redo_commit(xl_xact_commit *xlrec, TransactionId xid)
 	/* Make sure files supposed to be dropped are dropped */
 	for (i = 0; i < xlrec->nrels; i++)
 	{
-		SMgrRelation srel = smgropen(xlrec->xnodes[i]);
-		ForkNumber	fork;
-
-		for (fork = 0; fork <= MAX_FORKNUM; fork++)
-		{
-			if (smgrexists(srel, fork))
-			{
-				XLogDropRelation(xlrec->xnodes[i], fork);
-				smgrdounlink(srel, fork, false, true);
-			}
-		}
-		smgrclose(srel);
+		XLogDropRelation(xlrec->xnodes[i]);
+		smgrdounlink(smgropen(xlrec->xnodes[i]), false, true);
 	}
 }
 
@@ -4265,9 +4194,11 @@ xact_redo_abort(xl_xact_abort *xlrec, TransactionId xid)
 	TransactionId max_xid;
 	int			i;
 
-	/* Mark the transaction aborted in pg_clog */
+	TransactionIdAbort(xid);
+
+	/* Mark subtransactions as aborted */
 	sub_xids = (TransactionId *) &(xlrec->xnodes[xlrec->nrels]);
-	TransactionIdAbortTree(xid, xlrec->nsubxacts, sub_xids);
+	TransactionIdAbortTree(xlrec->nsubxacts, sub_xids);
 
 	/* Make sure nextXid is beyond any XID mentioned in the record */
 	max_xid = xid;
@@ -4286,18 +4217,8 @@ xact_redo_abort(xl_xact_abort *xlrec, TransactionId xid)
 	/* Make sure files supposed to be dropped are dropped */
 	for (i = 0; i < xlrec->nrels; i++)
 	{
-		SMgrRelation srel = smgropen(xlrec->xnodes[i]);
-		ForkNumber	fork;
-
-		for (fork = 0; fork <= MAX_FORKNUM; fork++)
-		{
-			if (smgrexists(srel, fork))
-			{
-				XLogDropRelation(xlrec->xnodes[i], fork);
-				smgrdounlink(srel, fork, false, true);
-			}
-		}
-		smgrclose(srel);
+		XLogDropRelation(xlrec->xnodes[i]);
+		smgrdounlink(smgropen(xlrec->xnodes[i]), false, true);
 	}
 }
 
@@ -4305,9 +4226,6 @@ void
 xact_redo(XLogRecPtr lsn, XLogRecord *record)
 {
 	uint8		info = record->xl_info & ~XLR_INFO_MASK;
-
-	/* Backup blocks are not used in xact records */
-	Assert(!(record->xl_info & XLR_BKP_BLOCK_MASK));
 
 	if (info == XLOG_XACT_COMMIT)
 	{
@@ -4356,10 +4274,10 @@ xact_desc_commit(StringInfo buf, xl_xact_commit *xlrec)
 		appendStringInfo(buf, "; rels:");
 		for (i = 0; i < xlrec->nrels; i++)
 		{
-			char	   *path = relpath(xlrec->xnodes[i], MAIN_FORKNUM);
+			RelFileNode rnode = xlrec->xnodes[i];
 
-			appendStringInfo(buf, " %s", path);
-			pfree(path);
+			appendStringInfo(buf, " %u/%u/%u",
+							 rnode.spcNode, rnode.dbNode, rnode.relNode);
 		}
 	}
 	if (xlrec->nsubxacts > 0)
@@ -4384,10 +4302,10 @@ xact_desc_abort(StringInfo buf, xl_xact_abort *xlrec)
 		appendStringInfo(buf, "; rels:");
 		for (i = 0; i < xlrec->nrels; i++)
 		{
-			char	   *path = relpath(xlrec->xnodes[i], MAIN_FORKNUM);
+			RelFileNode rnode = xlrec->xnodes[i];
 
-			appendStringInfo(buf, " %s", path);
-			pfree(path);
+			appendStringInfo(buf, " %u/%u/%u",
+							 rnode.spcNode, rnode.dbNode, rnode.relNode);
 		}
 	}
 	if (xlrec->nsubxacts > 0)

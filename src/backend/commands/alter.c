@@ -3,12 +3,12 @@
  * alter.c
  *	  Drivers for generic alter commands
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/alter.c,v 1.31 2009/01/01 17:23:37 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/alter.c,v 1.26 2008/01/01 19:45:48 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -117,7 +117,7 @@ ExecRenameStmt(RenameStmt *stmt)
 								aclcheck_error(aclresult, ACL_KIND_NAMESPACE,
 											get_namespace_name(namespaceId));
 
-							RenameRelation(relid, stmt->newname, stmt->renameType);
+							renamerel(relid, stmt->newname, stmt->renameType);
 							break;
 						}
 					case OBJECT_COLUMN:
@@ -154,10 +154,6 @@ ExecRenameStmt(RenameStmt *stmt)
 			RenameTSConfiguration(stmt->object, stmt->newname);
 			break;
 
-		case OBJECT_TYPE:
-			RenameType(stmt->object, stmt->newname);
-			break;
-
 		default:
 			elog(ERROR, "unrecognized rename stmt type: %d",
 				 (int) stmt->renameType);
@@ -185,10 +181,8 @@ ExecAlterObjectSchemaStmt(AlterObjectSchemaStmt *stmt)
 
 		case OBJECT_SEQUENCE:
 		case OBJECT_TABLE:
-		case OBJECT_VIEW:
 			CheckRelationOwnership(stmt->relation, true);
-			AlterTableNamespace(stmt->relation, stmt->newschema,
-								stmt->objectType);
+			AlterTableNamespace(stmt->relation, stmt->newschema);
 			break;
 
 		case OBJECT_TYPE:
@@ -222,7 +216,7 @@ ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 			break;
 
 		case OBJECT_DATABASE:
-			AlterDatabaseOwner(strVal(linitial(stmt->object)), newowner);
+			AlterDatabaseOwner((char *) linitial(stmt->object), newowner);
 			break;
 
 		case OBJECT_FUNCTION:
@@ -230,7 +224,7 @@ ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 			break;
 
 		case OBJECT_LANGUAGE:
-			AlterLanguageOwner(strVal(linitial(stmt->object)), newowner);
+			AlterLanguageOwner((char *) linitial(stmt->object), newowner);
 			break;
 
 		case OBJECT_OPERATOR:
@@ -250,11 +244,11 @@ ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 			break;
 
 		case OBJECT_SCHEMA:
-			AlterSchemaOwner(strVal(linitial(stmt->object)), newowner);
+			AlterSchemaOwner((char *) linitial(stmt->object), newowner);
 			break;
 
 		case OBJECT_TABLESPACE:
-			AlterTableSpaceOwner(strVal(linitial(stmt->object)), newowner);
+			AlterTableSpaceOwner((char *) linitial(stmt->object), newowner);
 			break;
 
 		case OBJECT_TYPE:
@@ -268,15 +262,6 @@ ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 
 		case OBJECT_TSCONFIGURATION:
 			AlterTSConfigurationOwner(stmt->object, newowner);
-			break;
-
-		case OBJECT_FDW:
-			AlterForeignDataWrapperOwner(strVal(linitial(stmt->object)),
-										 newowner);
-			break;
-
-		case OBJECT_FOREIGN_SERVER:
-			AlterForeignServerOwner(strVal(linitial(stmt->object)), newowner);
 			break;
 
 		default:

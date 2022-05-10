@@ -6,12 +6,12 @@
 #    files.  These .bki files are used to initialize the postgres template
 #    database.
 #
-# Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 #
 # IDENTIFICATION
-#    $PostgreSQL: pgsql/src/backend/catalog/genbki.sh,v 1.46 2009/01/01 17:23:36 momjian Exp $
+#    $PostgreSQL: pgsql/src/backend/catalog/genbki.sh,v 1.43 2008/01/01 19:45:48 momjian Exp $
 #
 # NOTES
 #    non-essential whitespace is removed from the generated file.
@@ -59,7 +59,7 @@ do
             echo "  $CMDNAME [ -I dir ] --set-version=VERSION -o prefix files..."
             echo
             echo "Options:"
-            echo "  -I  path to include files"
+            echo "  -I  path to pg_config_manual.h file"
             echo "  -o  prefix of output files"
             echo "  --set-version  PostgreSQL version number for initdb cross-check"
             echo
@@ -106,11 +106,13 @@ TMPFILE="genbkitmp$$.c"
 trap "rm -f $TMPFILE ${OUTPUT_PREFIX}.bki.$$ ${OUTPUT_PREFIX}.description.$$ ${OUTPUT_PREFIX}.shdescription.$$" 0 1 2 3 15
 
 
-# CAUTION: be wary about what symbols you substitute into the .bki file here!
-# It's okay to substitute things that are expected to be really constant
-# within a given Postgres release, such as fixed OIDs.  Do not substitute
-# anything that could depend on platform or configuration.  (The right place
-# to handle those sorts of things is in initdb.c's bootstrap_template1().)
+# Get NAMEDATALEN from pg_config_manual.h
+for dir in $INCLUDE_DIRS; do
+    if [ -f "$dir/pg_config_manual.h" ]; then
+        NAMEDATALEN=`grep '^#define[ 	]*NAMEDATALEN' $dir/pg_config_manual.h | $AWK '{ print $3 }'`
+        break
+    fi
+done
 
 # Get BOOTSTRAP_SUPERUSERID from catalog/pg_authid.h
 for dir in $INCLUDE_DIRS; do
@@ -161,6 +163,7 @@ sed -e "s/;[ 	]*$//g" \
     -e "s/^TransactionId/xid/g" \
     -e "s/(TransactionId/(xid/g" \
     -e "s/PGUID/$BOOTSTRAP_SUPERUSERID/g" \
+    -e "s/NAMEDATALEN/$NAMEDATALEN/g" \
     -e "s/PGNSP/$PG_CATALOG_NAMESPACE/g" \
 | $AWK '
 # ----------------

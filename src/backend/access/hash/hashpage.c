@@ -3,12 +3,12 @@
  * hashpage.c
  *	  Hash table page management code for the Postgres hash access method
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/hash/hashpage.c,v 1.80.2.1 2009/11/01 21:25:32 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/access/hash/hashpage.c,v 1.72 2008/01/01 19:45:46 momjian Exp $
  *
  * NOTES
  *	  Postgres hash pages look like ordinary relation pages.  The opaque
@@ -31,7 +31,6 @@
 #include "access/genam.h"
 #include "access/hash.h"
 #include "miscadmin.h"
-#include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
 #include "utils/lsyscache.h"
@@ -158,7 +157,7 @@ _hash_getinitbuf(Relation rel, BlockNumber blkno)
 	if (blkno == P_NEW)
 		elog(ERROR, "hash AM does not use P_NEW");
 
-	buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_ZERO, NULL);
+	buf = ReadOrZeroBuffer(rel, blkno);
 
 	LockBuffer(buf, HASH_WRITE);
 
@@ -203,7 +202,7 @@ _hash_getnewbuf(Relation rel, BlockNumber blkno)
 				 BufferGetBlockNumber(buf), blkno);
 	}
 	else
-		buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_ZERO, NULL);
+		buf = ReadOrZeroBuffer(rel, blkno);
 
 	LockBuffer(buf, HASH_WRITE);
 
@@ -231,7 +230,7 @@ _hash_getbuf_with_strategy(Relation rel, BlockNumber blkno,
 	if (blkno == P_NEW)
 		elog(ERROR, "hash AM does not use P_NEW");
 
-	buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, bstrategy);
+	buf = ReadBufferWithStrategy(rel, blkno, bstrategy);
 
 	if (access != HASH_NOLOCK)
 		LockBuffer(buf, access);
@@ -313,18 +312,15 @@ _hash_chgbufaccess(Relation rel,
 
 /*
  *	_hash_metapinit() -- Initialize the metadata page of a hash index,
- *				the initial buckets, and the initial bitmap page.
- *
- * The initial number of buckets is dependent on num_tuples, an estimate
- * of the number of tuples to be loaded into the index initially.  The
- * chosen number of buckets is returned.
+ *				the two buckets that we begin with and the initial
+ *				bitmap page.
  *
  * We are fairly cavalier about locking here, since we know that no one else
  * could be accessing this index.  In particular the rule about not holding
  * multiple buffer locks is ignored.
  */
-uint32
-_hash_metapinit(Relation rel, double num_tuples)
+void
+_hash_metapinit(Relation rel)
 {
 	HashMetaPage metap;
 	HashPageOpaque pageopaque;
@@ -334,10 +330,7 @@ _hash_metapinit(Relation rel, double num_tuples)
 	int32		data_width;
 	int32		item_width;
 	int32		ffactor;
-	double		dnumbuckets;
-	uint32		num_buckets;
-	uint32		log2_num_buckets;
-	uint32		i;
+	uint16		i;
 
 	/* safety check */
 	if (RelationGetNumberOfBlocks(rel) != 0)
@@ -348,9 +341,11 @@ _hash_metapinit(Relation rel, double num_tuples)
 	 * Determine the target fill factor (in tuples per bucket) for this index.
 	 * The idea is to make the fill factor correspond to pages about as full
 	 * as the user-settable fillfactor parameter says.	We can compute it
-	 * exactly since the index datatype (i.e. uint32 hash key) is fixed-width.
+	 * exactly if the index datatype is fixed-width, but for var-width there's
+	 * some guessing involved.
 	 */
-	data_width = sizeof(uint32);
+	data_width = get_typavgwidth(RelationGetDescr(rel)->attrs[0]->atttypid,
+								 RelationGetDescr(rel)->attrs[0]->atttypmod);
 	item_width = MAXALIGN(sizeof(IndexTupleData)) + MAXALIGN(data_width) +
 		sizeof(ItemIdData);		/* include the line pointer */
 	ffactor = RelationGetTargetPageUsage(rel, HASH_DEFAULT_FILLFACTOR) / item_width;
@@ -359,26 +354,7 @@ _hash_metapinit(Relation rel, double num_tuples)
 		ffactor = 10;
 
 	/*
-	 * Choose the number of initial bucket pages to match the fill factor
-	 * given the estimated number of tuples.  We round up the result to the
-	 * next power of 2, however, and always force at least 2 bucket pages. The
-	 * upper limit is determined by considerations explained in
-	 * _hash_expandtable().
-	 */
-	dnumbuckets = num_tuples / ffactor;
-	if (dnumbuckets <= 2.0)
-		num_buckets = 2;
-	else if (dnumbuckets >= (double) 0x40000000)
-		num_buckets = 0x40000000;
-	else
-		num_buckets = ((uint32) 1) << _hash_log2((uint32) dnumbuckets);
-
-	log2_num_buckets = _hash_log2(num_buckets);
-	Assert(num_buckets == (((uint32) 1) << log2_num_buckets));
-	Assert(log2_num_buckets < HASH_MAX_SPLITPOINTS);
-
-	/*
-	 * We initialize the metapage, the first N bucket pages, and the first
+	 * We initialize the metapage, the first two bucket pages, and the first
 	 * bitmap page in sequence, using _hash_getnewbuf to cause smgrextend()
 	 * calls to occur.	This ensures that the smgr level has the right idea of
 	 * the physical index length.
@@ -393,18 +369,20 @@ _hash_metapinit(Relation rel, double num_tuples)
 	pageopaque->hasho_flag = LH_META_PAGE;
 	pageopaque->hasho_page_id = HASHO_PAGE_ID;
 
-	metap = HashPageGetMeta(pg);
+	metap = (HashMetaPage) pg;
 
 	metap->hashm_magic = HASH_MAGIC;
 	metap->hashm_version = HASH_VERSION;
 	metap->hashm_ntuples = 0;
 	metap->hashm_nmaps = 0;
 	metap->hashm_ffactor = ffactor;
-	metap->hashm_bsize = HashGetMaxBitmapSize(pg);
+	metap->hashm_bsize = BufferGetPageSize(metabuf);
 	/* find largest bitmap array size that will fit in page size */
 	for (i = _hash_log2(metap->hashm_bsize); i > 0; --i)
 	{
-		if ((1 << i) <= metap->hashm_bsize)
+		if ((1 << i) <= (metap->hashm_bsize -
+						 (MAXALIGN(sizeof(PageHeaderData)) +
+						  MAXALIGN(sizeof(HashPageOpaqueData)))))
 			break;
 	}
 	Assert(i > 0);
@@ -420,37 +398,24 @@ _hash_metapinit(Relation rel, double num_tuples)
 	metap->hashm_procid = index_getprocid(rel, 1, HASHPROC);
 
 	/*
-	 * We initialize the index with N buckets, 0 .. N-1, occupying physical
-	 * blocks 1 to N.  The first freespace bitmap page is in block N+1. Since
-	 * N is a power of 2, we can set the masks this way:
+	 * We initialize the index with two buckets, 0 and 1, occupying physical
+	 * blocks 1 and 2.	The first freespace bitmap page is in block 3.
 	 */
-	metap->hashm_maxbucket = metap->hashm_lowmask = num_buckets - 1;
-	metap->hashm_highmask = (num_buckets << 1) - 1;
+	metap->hashm_maxbucket = metap->hashm_lowmask = 1;	/* nbuckets - 1 */
+	metap->hashm_highmask = 3;	/* (nbuckets << 1) - 1 */
 
 	MemSet(metap->hashm_spares, 0, sizeof(metap->hashm_spares));
 	MemSet(metap->hashm_mapp, 0, sizeof(metap->hashm_mapp));
 
-	/* Set up mapping for one spare page after the initial splitpoints */
-	metap->hashm_spares[log2_num_buckets] = 1;
-	metap->hashm_ovflpoint = log2_num_buckets;
+	metap->hashm_spares[1] = 1; /* the first bitmap page is only spare */
+	metap->hashm_ovflpoint = 1;
 	metap->hashm_firstfree = 0;
 
 	/*
-	 * Release buffer lock on the metapage while we initialize buckets.
-	 * Otherwise, we'll be in interrupt holdoff and the CHECK_FOR_INTERRUPTS
-	 * won't accomplish anything.  It's a bad idea to hold buffer locks for
-	 * long intervals in any case, since that can block the bgwriter.
+	 * Initialize the first two buckets
 	 */
-	_hash_chgbufaccess(rel, metabuf, HASH_WRITE, HASH_NOLOCK);
-
-	/*
-	 * Initialize the first N buckets
-	 */
-	for (i = 0; i < num_buckets; i++)
+	for (i = 0; i <= 1; i++)
 	{
-		/* Allow interrupts, in case N is huge */
-		CHECK_FOR_INTERRUPTS();
-
 		buf = _hash_getnewbuf(rel, BUCKET_TO_BLKNO(metap, i));
 		pg = BufferGetPage(buf);
 		pageopaque = (HashPageOpaque) PageGetSpecialPointer(pg);
@@ -462,18 +427,13 @@ _hash_metapinit(Relation rel, double num_tuples)
 		_hash_wrtbuf(rel, buf);
 	}
 
-	/* Now reacquire buffer lock on metapage */
-	_hash_chgbufaccess(rel, metabuf, HASH_NOLOCK, HASH_WRITE);
-
 	/*
 	 * Initialize first bitmap page
 	 */
-	_hash_initbitmap(rel, metap, num_buckets + 1);
+	_hash_initbitmap(rel, metap, 3);
 
 	/* all done */
 	_hash_wrtbuf(rel, metabuf);
-
-	return num_buckets;
 }
 
 /*
@@ -528,7 +488,7 @@ _hash_expandtable(Relation rel, Buffer metabuf)
 	_hash_chgbufaccess(rel, metabuf, HASH_NOLOCK, HASH_WRITE);
 
 	_hash_checkpage(rel, metabuf, LH_META_PAGE);
-	metap = HashPageGetMeta(BufferGetPage(metabuf));
+	metap = (HashMetaPage) BufferGetPage(metabuf);
 
 	/*
 	 * Check to see if split is still needed; someone else might have already
@@ -551,9 +511,6 @@ _hash_expandtable(Relation rel, Buffer metabuf)
 	 * index with 2^32 buckets would certainly overflow BlockNumber and hence
 	 * _hash_alloc_buckets() would fail, but if we supported buckets smaller
 	 * than a disk block then this would be an independent constraint.
-	 *
-	 * If you change this, see also the maximum initial number of buckets in
-	 * _hash_metapinit().
 	 */
 	if (metap->hashm_maxbucket >= (uint32) 0x7FFFFFFE)
 		goto fail;
@@ -733,7 +690,7 @@ _hash_alloc_buckets(Relation rel, BlockNumber firstblock, uint32 nblocks)
 	MemSet(zerobuf, 0, sizeof(zerobuf));
 
 	RelationOpenSmgr(rel);
-	smgrextend(rel->rd_smgr, MAIN_FORKNUM, lastblock, zerobuf, rel->rd_istemp);
+	smgrextend(rel->rd_smgr, lastblock, zerobuf, rel->rd_istemp);
 
 	return true;
 }
@@ -765,14 +722,23 @@ _hash_splitbucket(Relation rel,
 				  uint32 highmask,
 				  uint32 lowmask)
 {
-	BlockNumber oblkno;
-	BlockNumber nblkno;
+	Bucket		bucket;
 	Buffer		obuf;
 	Buffer		nbuf;
-	Page		opage;
-	Page		npage;
+	BlockNumber oblkno;
+	BlockNumber nblkno;
+	bool		null;
+	Datum		datum;
 	HashPageOpaque oopaque;
 	HashPageOpaque nopaque;
+	IndexTuple	itup;
+	Size		itemsz;
+	OffsetNumber ooffnum;
+	OffsetNumber noffnum;
+	OffsetNumber omaxoffnum;
+	Page		opage;
+	Page		npage;
+	TupleDesc	itupdesc = RelationGetDescr(rel);
 
 	/*
 	 * It should be okay to simultaneously write-lock pages from each bucket,
@@ -799,100 +765,100 @@ _hash_splitbucket(Relation rel,
 	/*
 	 * Partition the tuples in the old bucket between the old bucket and the
 	 * new bucket, advancing along the old bucket's overflow bucket chain and
-	 * adding overflow pages to the new bucket as needed.  Outer loop
-	 * iterates once per page in old bucket.
+	 * adding overflow pages to the new bucket as needed.
 	 */
+	ooffnum = FirstOffsetNumber;
+	omaxoffnum = PageGetMaxOffsetNumber(opage);
 	for (;;)
 	{
-		OffsetNumber ooffnum;
-		OffsetNumber omaxoffnum;
-		OffsetNumber deletable[MaxOffsetNumber];
-		int			ndeletable = 0;
+		/*
+		 * at each iteration through this loop, each of these variables should
+		 * be up-to-date: obuf opage oopaque ooffnum omaxoffnum
+		 */
 
-		/* Scan each tuple in old page */
-		omaxoffnum = PageGetMaxOffsetNumber(opage);
-		for (ooffnum = FirstOffsetNumber;
-			 ooffnum <= omaxoffnum;
-			 ooffnum = OffsetNumberNext(ooffnum))
+		/* check if we're at the end of the page */
+		if (ooffnum > omaxoffnum)
 		{
-			IndexTuple	itup;
-			Size		itemsz;
-			Bucket		bucket;
+			/* at end of page, but check for an(other) overflow page */
+			oblkno = oopaque->hasho_nextblkno;
+			if (!BlockNumberIsValid(oblkno))
+				break;
 
 			/*
-			 * Fetch the item's hash key (conveniently stored in the item) and
-			 * determine which bucket it now belongs in.
+			 * we ran out of tuples on this particular page, but we have more
+			 * overflow pages; advance to next page.
 			 */
-			itup = (IndexTuple) PageGetItem(opage,
-											PageGetItemId(opage, ooffnum));
-			bucket = _hash_hashkey2bucket(_hash_get_indextuple_hashkey(itup),
-										  maxbucket, highmask, lowmask);
+			_hash_wrtbuf(rel, obuf);
 
-			if (bucket == nbucket)
-			{
-				/*
-				 * insert the tuple into the new bucket.  if it doesn't fit on
-				 * the current page in the new bucket, we must allocate a new
-				 * overflow page and place the tuple on that page instead.
-				 */
-				itemsz = IndexTupleDSize(*itup);
-				itemsz = MAXALIGN(itemsz);
-
-				if (PageGetFreeSpace(npage) < itemsz)
-				{
-					/* write out nbuf and drop lock, but keep pin */
-					_hash_chgbufaccess(rel, nbuf, HASH_WRITE, HASH_NOLOCK);
-					/* chain to a new overflow page */
-					nbuf = _hash_addovflpage(rel, metabuf, nbuf);
-					npage = BufferGetPage(nbuf);
-					/* we don't need nblkno or nopaque within the loop */
-				}
-
-				/*
-				 * Insert tuple on new page, using _hash_pgaddtup to ensure
-				 * correct ordering by hashkey.  This is a tad inefficient
-				 * since we may have to shuffle itempointers repeatedly.
-				 * Possible future improvement: accumulate all the items for
-				 * the new page and qsort them before insertion.
-				 */
-				(void) _hash_pgaddtup(rel, nbuf, itemsz, itup);
-
-				/*
-				 * Mark tuple for deletion from old page.
-				 */
-				deletable[ndeletable++] = ooffnum;
-			}
-			else
-			{
-				/*
-				 * the tuple stays on this page, so nothing to do.
-				 */
-				Assert(bucket == obucket);
-			}
+			obuf = _hash_getbuf(rel, oblkno, HASH_WRITE, LH_OVERFLOW_PAGE);
+			opage = BufferGetPage(obuf);
+			oopaque = (HashPageOpaque) PageGetSpecialPointer(opage);
+			ooffnum = FirstOffsetNumber;
+			omaxoffnum = PageGetMaxOffsetNumber(opage);
+			continue;
 		}
-
-		oblkno = oopaque->hasho_nextblkno;
 
 		/*
-		 * Done scanning this old page.  If we moved any tuples, delete them
-		 * from the old page.
+		 * Re-hash the tuple to determine which bucket it now belongs in.
+		 *
+		 * It is annoying to call the hash function while holding locks, but
+		 * releasing and relocking the page for each tuple is unappealing too.
 		 */
-		if (ndeletable > 0)
+		itup = (IndexTuple) PageGetItem(opage, PageGetItemId(opage, ooffnum));
+		datum = index_getattr(itup, 1, itupdesc, &null);
+		Assert(!null);
+
+		bucket = _hash_hashkey2bucket(_hash_datum2hashkey(rel, datum),
+									  maxbucket, highmask, lowmask);
+
+		if (bucket == nbucket)
 		{
-			PageIndexMultiDelete(opage, deletable, ndeletable);
-			_hash_wrtbuf(rel, obuf);
+			/*
+			 * insert the tuple into the new bucket.  if it doesn't fit on the
+			 * current page in the new bucket, we must allocate a new overflow
+			 * page and place the tuple on that page instead.
+			 */
+			itemsz = IndexTupleDSize(*itup);
+			itemsz = MAXALIGN(itemsz);
+
+			if (PageGetFreeSpace(npage) < itemsz)
+			{
+				/* write out nbuf and drop lock, but keep pin */
+				_hash_chgbufaccess(rel, nbuf, HASH_WRITE, HASH_NOLOCK);
+				/* chain to a new overflow page */
+				nbuf = _hash_addovflpage(rel, metabuf, nbuf);
+				npage = BufferGetPage(nbuf);
+				/* we don't need nopaque within the loop */
+			}
+
+			noffnum = OffsetNumberNext(PageGetMaxOffsetNumber(npage));
+			if (PageAddItem(npage, (Item) itup, itemsz, noffnum, false, false)
+				== InvalidOffsetNumber)
+				elog(ERROR, "failed to add index item to \"%s\"",
+					 RelationGetRelationName(rel));
+
+			/*
+			 * now delete the tuple from the old bucket.  after this section
+			 * of code, 'ooffnum' will actually point to the ItemId to which
+			 * we would point if we had advanced it before the deletion
+			 * (PageIndexTupleDelete repacks the ItemId array).  this also
+			 * means that 'omaxoffnum' is exactly one less than it used to be,
+			 * so we really can just decrement it instead of calling
+			 * PageGetMaxOffsetNumber.
+			 */
+			PageIndexTupleDelete(opage, ooffnum);
+			omaxoffnum = OffsetNumberPrev(omaxoffnum);
 		}
 		else
-			_hash_relbuf(rel, obuf);
-
-		/* Exit loop if no more overflow pages in old bucket */
-		if (!BlockNumberIsValid(oblkno))
-			break;
-
-		/* Else, advance to next old page */
-		obuf = _hash_getbuf(rel, oblkno, HASH_WRITE, LH_OVERFLOW_PAGE);
-		opage = BufferGetPage(obuf);
-		oopaque = (HashPageOpaque) PageGetSpecialPointer(opage);
+		{
+			/*
+			 * the tuple stays on this page.  we didn't move anything, so we
+			 * didn't delete anything and therefore we don't have to change
+			 * 'omaxoffnum'.
+			 */
+			Assert(bucket == obucket);
+			ooffnum = OffsetNumberNext(ooffnum);
+		}
 	}
 
 	/*
@@ -901,6 +867,7 @@ _hash_splitbucket(Relation rel,
 	 * tuples remaining in the old bucket (including the overflow pages) are
 	 * packed as tightly as possible.  The new bucket is already tight.
 	 */
+	_hash_wrtbuf(rel, obuf);
 	_hash_wrtbuf(rel, nbuf);
 
 	_hash_squeezebucket(rel, obucket, start_oblkno, NULL);

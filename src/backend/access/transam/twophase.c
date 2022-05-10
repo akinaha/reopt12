@@ -3,11 +3,11 @@
  * twophase.c
  *		Two-phase commit support functions.
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *		$PostgreSQL: pgsql/src/backend/access/transam/twophase.c,v 1.54.2.1 2009/11/23 09:58:51 heikki Exp $
+ *		$PostgreSQL: pgsql/src/backend/access/transam/twophase.c,v 1.39 2008/01/01 19:45:48 momjian Exp $
  *
  * NOTES
  *		Each global transaction is associated with a global transaction
@@ -42,24 +42,20 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "access/htup.h"
+#include "access/heapam.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
-#include "access/xlogutils.h"
 #include "catalog/pg_type.h"
-#include "catalog/storage.h"
 #include "funcapi.h"
 #include "miscadmin.h"
-#include "pg_trace.h"
 #include "pgstat.h"
 #include "storage/fd.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
-#include "utils/memutils.h"
 
 
 /*
@@ -68,7 +64,7 @@
 #define TWOPHASE_DIR "pg_twophase"
 
 /* GUC variable, can't be changed after startup */
-int			max_prepared_xacts = 0;
+int			max_prepared_xacts = 5;
 
 /*
  * This struct describes one global transaction that is in prepared state
@@ -109,7 +105,6 @@ int			max_prepared_xacts = 0;
 typedef struct GlobalTransactionData
 {
 	PGPROC		proc;			/* dummy proc */
-	BackendId	dummyBackendId;	/* similar to backend id for backends */
 	TimestampTz prepared_at;	/* time of preparation */
 	XLogRecPtr	prepare_lsn;	/* XLOG offset of prepare record */
 	Oid			owner;			/* ID of user that executed the xact */
@@ -125,7 +120,7 @@ typedef struct GlobalTransactionData
 typedef struct TwoPhaseStateData
 {
 	/* Head of linked list of free GlobalTransactionData structs */
-	GlobalTransaction freeGXacts;
+	SHMEM_OFFSET freeGXacts;
 
 	/* Number of valid prepXacts entries. */
 	int			numPrepXacts;
@@ -187,7 +182,7 @@ TwoPhaseShmemInit(void)
 		int			i;
 
 		Assert(!found);
-		TwoPhaseState->freeGXacts = NULL;
+		TwoPhaseState->freeGXacts = INVALID_OFFSET;
 		TwoPhaseState->numPrepXacts = 0;
 
 		/*
@@ -199,22 +194,8 @@ TwoPhaseShmemInit(void)
 					  sizeof(GlobalTransaction) * max_prepared_xacts));
 		for (i = 0; i < max_prepared_xacts; i++)
 		{
-			gxacts[i].proc.links.next = (SHM_QUEUE *) TwoPhaseState->freeGXacts;
-			TwoPhaseState->freeGXacts = &gxacts[i];
-
-			/*
-			 * Assign a unique ID for each dummy proc, so that the range of
-			 * dummy backend IDs immediately follows the range of normal
-			 * backend IDs. We don't dare to assign a real backend ID to
-			 * dummy procs, because prepared transactions don't take part in
-			 * cache invalidation like a real backend ID would imply, but
-			 * having a unique ID for them is nevertheless handy. This
-			 * arrangement allows you to allocate an array of size
-			 * (MaxBackends + max_prepared_xacts + 1), and have a slot for
-			 * every backend and prepared transaction. Currently multixact.c
-			 * uses that technique.
-			 */
-			gxacts[i].dummyBackendId = MaxBackends + 1 + i;
+			gxacts[i].proc.links.next = TwoPhaseState->freeGXacts;
+			TwoPhaseState->freeGXacts = MAKE_OFFSET(&gxacts[i]);
 		}
 	}
 	else
@@ -243,13 +224,6 @@ MarkAsPreparing(TransactionId xid, const char *gid,
 				 errmsg("transaction identifier \"%s\" is too long",
 						gid)));
 
-	/* fail immediately if feature is disabled */
-	if (max_prepared_xacts == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("prepared transactions are disabled"),
-			  errhint("Set max_prepared_transactions to a nonzero value.")));
-
 	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
 
 	/*
@@ -266,8 +240,8 @@ MarkAsPreparing(TransactionId xid, const char *gid,
 			TwoPhaseState->numPrepXacts--;
 			TwoPhaseState->prepXacts[i] = TwoPhaseState->prepXacts[TwoPhaseState->numPrepXacts];
 			/* and put it back in the freelist */
-			gxact->proc.links.next = (SHM_QUEUE *) TwoPhaseState->freeGXacts;
-			TwoPhaseState->freeGXacts = gxact;
+			gxact->proc.links.next = TwoPhaseState->freeGXacts;
+			TwoPhaseState->freeGXacts = MAKE_OFFSET(gxact);
 			/* Back up index count too, so we don't miss scanning one */
 			i--;
 		}
@@ -287,14 +261,14 @@ MarkAsPreparing(TransactionId xid, const char *gid,
 	}
 
 	/* Get a free gxact from the freelist */
-	if (TwoPhaseState->freeGXacts == NULL)
+	if (TwoPhaseState->freeGXacts == INVALID_OFFSET)
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("maximum number of prepared transactions reached"),
 				 errhint("Increase max_prepared_transactions (currently %d).",
 						 max_prepared_xacts)));
-	gxact = TwoPhaseState->freeGXacts;
-	TwoPhaseState->freeGXacts = (GlobalTransaction) gxact->proc.links.next;
+	gxact = (GlobalTransaction) MAKE_PTR(TwoPhaseState->freeGXacts);
+	TwoPhaseState->freeGXacts = gxact->proc.links.next;
 
 	/* Initialize it */
 	MemSet(&gxact->proc, 0, sizeof(PGPROC));
@@ -475,8 +449,8 @@ RemoveGXact(GlobalTransaction gxact)
 			TwoPhaseState->prepXacts[i] = TwoPhaseState->prepXacts[TwoPhaseState->numPrepXacts];
 
 			/* and put it back in the freelist */
-			gxact->proc.links.next = (SHM_QUEUE *) TwoPhaseState->freeGXacts;
-			TwoPhaseState->freeGXacts = gxact;
+			gxact->proc.links.next = TwoPhaseState->freeGXacts;
+			TwoPhaseState->freeGXacts = MAKE_OFFSET(gxact);
 
 			LWLockRelease(TwoPhaseStateLock);
 
@@ -649,7 +623,7 @@ pg_prepared_xact(PG_FUNCTION_ARGS)
 		MemSet(nulls, 0, sizeof(nulls));
 
 		values[0] = TransactionIdGetDatum(gxact->proc.xid);
-		values[1] = CStringGetTextDatum(gxact->gid);
+		values[1] = DirectFunctionCall1(textin, CStringGetDatum(gxact->gid));
 		values[2] = TimestampTzGetDatum(gxact->prepared_at);
 		values[3] = ObjectIdGetDatum(gxact->owner);
 		values[4] = ObjectIdGetDatum(gxact->proc.databaseId);
@@ -660,22 +634,6 @@ pg_prepared_xact(PG_FUNCTION_ARGS)
 	}
 
 	SRF_RETURN_DONE(funcctx);
-}
-
-/*
- * TwoPhaseGetDummyProc
- *		Get the dummy backend ID for prepared transaction specified by XID
- *
- * Dummy backend IDs are similar to real backend IDs of real backends.
- * They start at MaxBackends + 1, and are unique across all currently active
- * real backends and prepared transactions.
- */
-BackendId
-TwoPhaseGetDummyBackendId(TransactionId xid)
-{
-	PGPROC *proc = TwoPhaseGetDummyProc(xid);
-
-	return ((GlobalTransaction) proc)->dummyBackendId;
 }
 
 /*
@@ -869,6 +827,7 @@ StartPrepare(GlobalTransaction gxact)
 		save_state_data(children, hdr.nsubxacts * sizeof(TransactionId));
 		/* While we have the child-xact data, stuff it in the gxact too */
 		GXactLoadSubxactData(gxact, hdr.nsubxacts, children);
+		pfree(children);
 	}
 	if (hdr.ncommitrels > 0)
 	{
@@ -906,15 +865,6 @@ EndPrepare(GlobalTransaction gxact)
 	hdr = (TwoPhaseFileHeader *) records.head->data;
 	Assert(hdr->magic == TWOPHASE_MAGIC);
 	hdr->total_len = records.total_len + sizeof(pg_crc32);
-
-	/*
-	 * If the file size exceeds MaxAllocSize, we won't be able to read it in
-	 * ReadTwoPhaseFile. Check for that now, rather than fail at commit time.
-	 */
-	if (hdr->total_len > MaxAllocSize)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("two-phase state file maximum length exceeded")));
 
 	/*
 	 * Create the 2PC state file.
@@ -1096,9 +1046,7 @@ ReadTwoPhaseFile(TransactionId xid)
 
 	/*
 	 * Check file length.  We can determine a lower bound pretty easily. We
-	 * set an upper bound to avoid palloc() failure on a corrupt file, though
-	 * we can't guarantee that we won't get an out of memory error anyway,
-	 * even on a valid file.
+	 * set an upper bound mainly to avoid palloc() failure on a corrupt file.
 	 */
 	if (fstat(fd, &stat))
 	{
@@ -1113,7 +1061,7 @@ ReadTwoPhaseFile(TransactionId xid)
 	if (stat.st_size < (MAXALIGN(sizeof(TwoPhaseFileHeader)) +
 						MAXALIGN(sizeof(TwoPhaseRecordOnDisk)) +
 						sizeof(pg_crc32)) ||
-		stat.st_size > MaxAllocSize)
+		stat.st_size > 10000000)
 	{
 		close(fd);
 		return NULL;
@@ -1182,8 +1130,6 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	TransactionId *children;
 	RelFileNode *commitrels;
 	RelFileNode *abortrels;
-	RelFileNode *delrels;
-	int			ndelrels;
 	int			i;
 
 	/*
@@ -1256,25 +1202,13 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	 */
 	if (isCommit)
 	{
-		delrels = commitrels;
-		ndelrels = hdr->ncommitrels;
+		for (i = 0; i < hdr->ncommitrels; i++)
+			smgrdounlink(smgropen(commitrels[i]), false, false);
 	}
 	else
 	{
-		delrels = abortrels;
-		ndelrels = hdr->nabortrels;
-	}
-	for (i = 0; i < ndelrels; i++)
-	{
-		SMgrRelation srel = smgropen(delrels[i]);
-		ForkNumber	fork;
-
-		for (fork = 0; fork <= MAX_FORKNUM; fork++)
-		{
-			if (smgrexists(srel, fork))
-				smgrdounlink(srel, fork, false, false);
-		}
-		smgrclose(srel);
+		for (i = 0; i < hdr->nabortrels; i++)
+			smgrdounlink(smgropen(abortrels[i]), false, false);
 	}
 
 	/* And now do the callbacks */
@@ -1442,9 +1376,6 @@ CheckPointTwoPhase(XLogRecPtr redo_horizon)
 	 */
 	if (max_prepared_xacts <= 0)
 		return;					/* nothing to do */
-
-	TRACE_POSTGRESQL_TWOPHASE_CHECKPOINT_START();
-
 	xids = (TransactionId *) palloc(max_prepared_xacts * sizeof(TransactionId));
 	nxids = 0;
 
@@ -1502,8 +1433,6 @@ CheckPointTwoPhase(XLogRecPtr redo_horizon)
 	}
 
 	pfree(xids);
-
-	TRACE_POSTGRESQL_TWOPHASE_CHECKPOINT_DONE();
 }
 
 /*
@@ -1791,7 +1720,9 @@ RecordTransactionCommitPrepared(TransactionId xid,
 	XLogFlush(recptr);
 
 	/* Mark the transaction committed in pg_clog */
-	TransactionIdCommitTree(xid, nchildren, children);
+	TransactionIdCommit(xid);
+	/* to avoid race conditions, the parent must commit first */
+	TransactionIdCommitTree(nchildren, children);
 
 	/* Checkpoint can proceed now */
 	MyProc->inCommit = false;
@@ -1866,7 +1797,8 @@ RecordTransactionAbortPrepared(TransactionId xid,
 	 * Mark the transaction aborted in clog.  This is not absolutely necessary
 	 * but we may as well do it while we are here.
 	 */
-	TransactionIdAbortTree(xid, nchildren, children);
+	TransactionIdAbort(xid);
+	TransactionIdAbortTree(nchildren, children);
 
 	END_CRIT_SECTION();
 }

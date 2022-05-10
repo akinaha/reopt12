@@ -7,21 +7,21 @@
  * accessed via the extended FE/BE query protocol.
  *
  *
- * Copyright (c) 2002-2009, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2008, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/prepare.c,v 1.97.2.1 2009/12/29 17:41:09 heikki Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/prepare.c,v 1.80 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/explain.h"
 #include "commands/prepare.h"
 #include "miscadmin.h"
-#include "nodes/nodeFuncs.h"
 #include "parser/analyze.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_expr.h"
@@ -32,7 +32,6 @@
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
-#include "utils/snapmgr.h"
 
 
 /*
@@ -144,8 +143,8 @@ PrepareQuery(PrepareStmt *stmt, const char *queryString)
 	/* Rewrite the query. The result could be 0, 1, or many queries. */
 	query_list = QueryRewrite(query);
 
-	/* Generate plans for queries. */
-	plan_list = pg_plan_queries(query_list, 0, NULL);
+	/* Generate plans for queries.	Snapshot is already set. */
+	plan_list = pg_plan_queries(query_list, 0, NULL, false);
 
 	/*
 	 * Save the results.
@@ -163,12 +162,6 @@ PrepareQuery(PrepareStmt *stmt, const char *queryString)
 
 /*
  * Implements the 'EXECUTE' utility statement.
- *
- * Note: this is one of very few places in the code that needs to deal with
- * two query strings at once.  The passed-in queryString is that of the
- * EXECUTE, which we might need for error reporting while processing the
- * parameter expressions.  The query_string that we copy from the plan
- * source is that of the original PREPARE.
  */
 void
 ExecuteQuery(ExecuteStmt *stmt, const char *queryString,
@@ -181,7 +174,6 @@ ExecuteQuery(ExecuteStmt *stmt, const char *queryString,
 	ParamListInfo paramLI = NULL;
 	EState	   *estate = NULL;
 	Portal		portal;
-	char	   *query_string;
 
 	/* Look it up in the hash table */
 	entry = FetchPreparedStatement(stmt->name, true);
@@ -210,10 +202,6 @@ ExecuteQuery(ExecuteStmt *stmt, const char *queryString,
 	portal = CreateNewPortal();
 	/* Don't display the portal in pg_cursors, it is for internal use only */
 	portal->visible = false;
-
-	/* Copy the plan's saved query string into the portal's memory */
-	query_string = MemoryContextStrdup(PortalGetHeapMemory(portal),
-									   entry->plansource->query_string);
 
 	/*
 	 * For CREATE TABLE / AS EXECUTE, we must make a copy of the stored query
@@ -263,7 +251,7 @@ ExecuteQuery(ExecuteStmt *stmt, const char *queryString,
 
 	PortalDefineQuery(portal,
 					  NULL,
-					  query_string,
+					  entry->plansource->query_string,
 					  entry->plansource->commandTag,
 					  plan_list,
 					  cplan);
@@ -271,7 +259,7 @@ ExecuteQuery(ExecuteStmt *stmt, const char *queryString,
 	/*
 	 * Run the portal to completion.
 	 */
-	PortalStart(portal, paramLI, GetActiveSnapshot());
+	PortalStart(portal, paramLI, ActiveSnapshot);
 
 	(void) PortalRun(portal, FETCH_ALL, false, dest, dest, completionTag);
 
@@ -347,18 +335,13 @@ EvaluateParams(PreparedStatement *pstmt, List *params,
 			ereport(ERROR,
 					(errcode(ERRCODE_GROUPING_ERROR),
 			  errmsg("cannot use aggregate function in EXECUTE parameter")));
-		if (pstate->p_hasWindowFuncs)
-			ereport(ERROR,
-					(errcode(ERRCODE_WINDOWING_ERROR),
-				 errmsg("cannot use window function in EXECUTE parameter")));
 
 		given_type_id = exprType(expr);
 
 		expr = coerce_to_target_type(pstate, expr, given_type_id,
 									 expected_type_id, -1,
 									 COERCION_ASSIGNMENT,
-									 COERCE_IMPLICIT_CAST,
-									 -1);
+									 COERCE_IMPLICIT_CAST);
 
 		if (expr == NULL)
 			ereport(ERROR,
@@ -636,9 +619,6 @@ DropAllPreparedStatements(void)
 
 /*
  * Implements the 'EXPLAIN EXECUTE' utility statement.
- *
- * Note: the passed-in queryString is that of the EXPLAIN EXECUTE,
- * not the original PREPARE; we get the latter string from the plancache.
  */
 void
 ExplainExecuteQuery(ExecuteStmt *execstmt, ExplainStmt *stmt,
@@ -646,7 +626,6 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, ExplainStmt *stmt,
 					ParamListInfo params, TupOutputState *tstate)
 {
 	PreparedStatement *entry;
-	const char *query_string;
 	CachedPlan *cplan;
 	List	   *plan_list;
 	ListCell   *p;
@@ -662,8 +641,6 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, ExplainStmt *stmt,
 	/* Shouldn't get any non-fixed-result cached plan, either */
 	if (!entry->plansource->fixed_result)
 		elog(ERROR, "EXPLAIN EXECUTE does not support variable-result cached plans");
-
-	query_string = entry->plansource->query_string;
 
 	/* Replan if needed, and acquire a transient refcount */
 	cplan = RevalidateCachedPlan(entry->plansource, true);
@@ -707,12 +684,11 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, ExplainStmt *stmt,
 				pstmt->intoClause = execstmt->into;
 			}
 
-			ExplainOnePlan(pstmt, stmt, query_string,
-						   paramLI, tstate);
+			ExplainOnePlan(pstmt, paramLI, stmt, tstate);
 		}
 		else
 		{
-			ExplainOneUtility((Node *) pstmt, stmt, query_string,
+			ExplainOneUtility((Node *) pstmt, stmt, queryString,
 							  params, tstate);
 		}
 
@@ -777,12 +753,7 @@ pg_prepared_statement(PG_FUNCTION_ARGS)
 	 * We put all the tuples into a tuplestore in one scan of the hashtable.
 	 * This avoids any issue of the hashtable possibly changing between calls.
 	 */
-	tupstore =
-		tuplestore_begin_heap(rsinfo->allowedModes & SFRM_Materialize_Random,
-							  false, work_mem);
-
-	/* generate junk in short-term context */
-	MemoryContextSwitchTo(oldcontext);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
 
 	/* hash table might be uninitialized */
 	if (prepared_queries)
@@ -793,24 +764,41 @@ pg_prepared_statement(PG_FUNCTION_ARGS)
 		hash_seq_init(&hash_seq, prepared_queries);
 		while ((prep_stmt = hash_seq_search(&hash_seq)) != NULL)
 		{
+			HeapTuple	tuple;
 			Datum		values[5];
 			bool		nulls[5];
 
+			/* generate junk in short-term context */
+			MemoryContextSwitchTo(oldcontext);
+
 			MemSet(nulls, 0, sizeof(nulls));
 
-			values[0] = CStringGetTextDatum(prep_stmt->stmt_name);
-			values[1] = CStringGetTextDatum(prep_stmt->plansource->query_string);
+			values[0] = DirectFunctionCall1(textin,
+									  CStringGetDatum(prep_stmt->stmt_name));
+
+			if (prep_stmt->plansource->query_string == NULL)
+				nulls[1] = true;
+			else
+				values[1] = DirectFunctionCall1(textin,
+					   CStringGetDatum(prep_stmt->plansource->query_string));
+
 			values[2] = TimestampTzGetDatum(prep_stmt->prepare_time);
 			values[3] = build_regtype_array(prep_stmt->plansource->param_types,
 										  prep_stmt->plansource->num_params);
 			values[4] = BoolGetDatum(prep_stmt->from_sql);
 
-			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+			tuple = heap_form_tuple(tupdesc, values, nulls);
+
+			/* switch to appropriate context while storing the tuple */
+			MemoryContextSwitchTo(per_query_ctx);
+			tuplestore_puttuple(tupstore, tuple);
 		}
 	}
 
 	/* clean up and return the tuplestore */
 	tuplestore_donestoring(tupstore);
+
+	MemoryContextSwitchTo(oldcontext);
 
 	rsinfo->returnMode = SFRM_Materialize;
 	rsinfo->setResult = tupstore;

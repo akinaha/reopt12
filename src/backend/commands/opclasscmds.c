@@ -4,12 +4,12 @@
  *
  *	  Routines for opclass (and opfamily) manipulation commands
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/opclasscmds.c,v 1.64 2009/01/01 17:23:39 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/opclasscmds.c,v 1.58 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -19,7 +19,6 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
-#include "access/sysattr.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_amop.h"
@@ -39,9 +38,7 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
-#include "utils/rel.h"
 #include "utils/syscache.h"
-#include "utils/tqual.h"
 
 
 /*
@@ -54,6 +51,7 @@ typedef struct
 	int			number;			/* strategy or support proc number */
 	Oid			lefttype;		/* lefttype */
 	Oid			righttype;		/* righttype */
+	bool		recheck;		/* oper recheck flag (unused for proc) */
 } OpFamilyMember;
 
 
@@ -176,7 +174,7 @@ CreateOpFamily(char *amname, char *opfname, Oid namespaceoid, Oid amoid)
 	Relation	rel;
 	HeapTuple	tup;
 	Datum		values[Natts_pg_opfamily];
-	bool		nulls[Natts_pg_opfamily];
+	char		nulls[Natts_pg_opfamily];
 	NameData	opfName;
 	ObjectAddress myself,
 				referenced;
@@ -201,7 +199,7 @@ CreateOpFamily(char *amname, char *opfname, Oid namespaceoid, Oid amoid)
 	 * Okay, let's create the pg_opfamily entry.
 	 */
 	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
+	memset(nulls, ' ', sizeof(nulls));
 
 	values[Anum_pg_opfamily_opfmethod - 1] = ObjectIdGetDatum(amoid);
 	namestrcpy(&opfName, opfname);
@@ -209,7 +207,7 @@ CreateOpFamily(char *amname, char *opfname, Oid namespaceoid, Oid amoid)
 	values[Anum_pg_opfamily_opfnamespace - 1] = ObjectIdGetDatum(namespaceoid);
 	values[Anum_pg_opfamily_opfowner - 1] = ObjectIdGetDatum(GetUserId());
 
-	tup = heap_form_tuple(rel->rd_att, values, nulls);
+	tup = heap_formtuple(rel->rd_att, values, nulls);
 
 	opfamilyoid = simple_heap_insert(rel, tup);
 
@@ -264,7 +262,7 @@ DefineOpClass(CreateOpClassStmt *stmt)
 	HeapTuple	tup;
 	Form_pg_am	pg_am;
 	Datum		values[Natts_pg_opclass];
-	bool		nulls[Natts_pg_opclass];
+	char		nulls[Natts_pg_opclass];
 	AclResult	aclresult;
 	NameData	opcName;
 	ObjectAddress myself,
@@ -446,6 +444,7 @@ DefineOpClass(CreateOpClassStmt *stmt)
 				member = (OpFamilyMember *) palloc0(sizeof(OpFamilyMember));
 				member->object = operOid;
 				member->number = item->number;
+				member->recheck = item->recheck;
 				assignOperTypes(member, amoid, typeoid);
 				addFamilyMember(&operators, member, false);
 				break;
@@ -570,7 +569,7 @@ DefineOpClass(CreateOpClassStmt *stmt)
 	 * Okay, let's create the pg_opclass entry.
 	 */
 	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
+	memset(nulls, ' ', sizeof(nulls));
 
 	values[Anum_pg_opclass_opcmethod - 1] = ObjectIdGetDatum(amoid);
 	namestrcpy(&opcName, opcname);
@@ -582,7 +581,7 @@ DefineOpClass(CreateOpClassStmt *stmt)
 	values[Anum_pg_opclass_opcdefault - 1] = BoolGetDatum(stmt->isDefault);
 	values[Anum_pg_opclass_opckeytype - 1] = ObjectIdGetDatum(storageoid);
 
-	tup = heap_form_tuple(rel->rd_att, values, nulls);
+	tup = heap_formtuple(rel->rd_att, values, nulls);
 
 	opclassoid = simple_heap_insert(rel, tup);
 
@@ -656,7 +655,7 @@ DefineOpFamily(CreateOpFamilyStmt *stmt)
 	Relation	rel;
 	HeapTuple	tup;
 	Datum		values[Natts_pg_opfamily];
-	bool		nulls[Natts_pg_opfamily];
+	char		nulls[Natts_pg_opfamily];
 	AclResult	aclresult;
 	NameData	opfName;
 	ObjectAddress myself,
@@ -719,7 +718,7 @@ DefineOpFamily(CreateOpFamilyStmt *stmt)
 	 * Okay, let's create the pg_opfamily entry.
 	 */
 	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
+	memset(nulls, ' ', sizeof(nulls));
 
 	values[Anum_pg_opfamily_opfmethod - 1] = ObjectIdGetDatum(amoid);
 	namestrcpy(&opfName, opfname);
@@ -727,7 +726,7 @@ DefineOpFamily(CreateOpFamilyStmt *stmt)
 	values[Anum_pg_opfamily_opfnamespace - 1] = ObjectIdGetDatum(namespaceoid);
 	values[Anum_pg_opfamily_opfowner - 1] = ObjectIdGetDatum(GetUserId());
 
-	tup = heap_form_tuple(rel->rd_att, values, nulls);
+	tup = heap_formtuple(rel->rd_att, values, nulls);
 
 	opfamilyoid = simple_heap_insert(rel, tup);
 
@@ -898,6 +897,7 @@ AlterOpFamilyAdd(List *opfamilyname, Oid amoid, Oid opfamilyoid,
 				member = (OpFamilyMember *) palloc0(sizeof(OpFamilyMember));
 				member->object = operOid;
 				member->number = item->number;
+				member->recheck = item->recheck;
 				assignOperTypes(member, amoid, InvalidOid);
 				addFamilyMember(&operators, member, false);
 				break;
@@ -1226,7 +1226,7 @@ storeOperators(List *opfamilyname, Oid amoid,
 {
 	Relation	rel;
 	Datum		values[Natts_pg_amop];
-	bool		nulls[Natts_pg_amop];
+	char		nulls[Natts_pg_amop];
 	HeapTuple	tup;
 	Oid			entryoid;
 	ObjectAddress myself,
@@ -1259,16 +1259,17 @@ storeOperators(List *opfamilyname, Oid amoid,
 
 		/* Create the pg_amop entry */
 		memset(values, 0, sizeof(values));
-		memset(nulls, false, sizeof(nulls));
+		memset(nulls, ' ', sizeof(nulls));
 
 		values[Anum_pg_amop_amopfamily - 1] = ObjectIdGetDatum(opfamilyoid);
 		values[Anum_pg_amop_amoplefttype - 1] = ObjectIdGetDatum(op->lefttype);
 		values[Anum_pg_amop_amoprighttype - 1] = ObjectIdGetDatum(op->righttype);
 		values[Anum_pg_amop_amopstrategy - 1] = Int16GetDatum(op->number);
+		values[Anum_pg_amop_amopreqcheck - 1] = BoolGetDatum(op->recheck);
 		values[Anum_pg_amop_amopopr - 1] = ObjectIdGetDatum(op->object);
 		values[Anum_pg_amop_amopmethod - 1] = ObjectIdGetDatum(amoid);
 
-		tup = heap_form_tuple(rel->rd_att, values, nulls);
+		tup = heap_formtuple(rel->rd_att, values, nulls);
 
 		entryoid = simple_heap_insert(rel, tup);
 
@@ -1326,7 +1327,7 @@ storeProcedures(List *opfamilyname, Oid amoid,
 {
 	Relation	rel;
 	Datum		values[Natts_pg_amproc];
-	bool		nulls[Natts_pg_amproc];
+	char		nulls[Natts_pg_amproc];
 	HeapTuple	tup;
 	Oid			entryoid;
 	ObjectAddress myself,
@@ -1359,7 +1360,7 @@ storeProcedures(List *opfamilyname, Oid amoid,
 
 		/* Create the pg_amproc entry */
 		memset(values, 0, sizeof(values));
-		memset(nulls, false, sizeof(nulls));
+		memset(nulls, ' ', sizeof(nulls));
 
 		values[Anum_pg_amproc_amprocfamily - 1] = ObjectIdGetDatum(opfamilyoid);
 		values[Anum_pg_amproc_amproclefttype - 1] = ObjectIdGetDatum(proc->lefttype);
@@ -1367,7 +1368,7 @@ storeProcedures(List *opfamilyname, Oid amoid,
 		values[Anum_pg_amproc_amprocnum - 1] = Int16GetDatum(proc->number);
 		values[Anum_pg_amproc_amproc - 1] = ObjectIdGetDatum(proc->object);
 
-		tup = heap_form_tuple(rel->rd_att, values, nulls);
+		tup = heap_formtuple(rel->rd_att, values, nulls);
 
 		entryoid = simple_heap_insert(rel, tup);
 

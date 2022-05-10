@@ -4,12 +4,12 @@
  * bootparse.y
  *	  yacc grammar for the "bootstrap" mode (BKI file format)
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/bootstrap/bootparse.y,v 1.96 2009/01/01 17:23:36 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/bootstrap/bootparse.y,v 1.91 2008/01/01 19:45:48 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -54,17 +54,6 @@
 #define atooid(x)	((Oid) strtoul((x), NULL, 10))
 
 
-/*
- * Bison doesn't allocate anything that needs to live across parser calls,
- * so we can easily have it use palloc instead of malloc.  This prevents
- * memory leaks if we error out during parsing.  Note this only works with
- * bison >= 2.0.  However, in bison 1.875 the default is to use alloca()
- * if possible, so there's not really much problem anyhow, at least if
- * you're building with gcc.
- */
-#define YYMALLOC palloc
-#define YYFREE   pfree
-
 static void
 do_start(void)
 {
@@ -91,7 +80,6 @@ int num_columns_read = 0;
 
 %}
 
-%expect 0
 %name-prefix="boot_yy"
 
 %union
@@ -218,7 +206,6 @@ Boot_CreateStmt:
 													  $6,
 													  BOOTSTRAP_SUPERUSERID,
 													  tupdesc,
-													  NIL,
 													  RELKIND_RELATION,
 													  $3,
 													  true,
@@ -259,7 +246,7 @@ Boot_DeclareIndexStmt:
 				{
 					do_start();
 
-					DefineIndex(makeRangeVar(NULL, LexIDStr($6), -1),
+					DefineIndex(makeRangeVar(NULL, LexIDStr($6)),
 								LexIDStr($3),
 								$4,
 								LexIDStr($8),
@@ -277,7 +264,7 @@ Boot_DeclareUniqueIndexStmt:
 				{
 					do_start();
 
-					DefineIndex(makeRangeVar(NULL, LexIDStr($7), -1),
+					DefineIndex(makeRangeVar(NULL, LexIDStr($7)),
 								LexIDStr($4),
 								$5,
 								LexIDStr($9),

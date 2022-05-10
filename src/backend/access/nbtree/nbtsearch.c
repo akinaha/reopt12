@@ -4,11 +4,11 @@
  *	  Search code for postgres btrees.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/nbtree/nbtsearch.c,v 1.120 2009/05/05 19:36:32 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/access/nbtree/nbtsearch.c,v 1.116 2008/01/01 19:45:46 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -17,12 +17,8 @@
 
 #include "access/genam.h"
 #include "access/nbtree.h"
-#include "access/relscan.h"
-#include "miscadmin.h"
 #include "pgstat.h"
-#include "storage/bufmgr.h"
 #include "utils/lsyscache.h"
-#include "utils/rel.h"
 
 
 static bool _bt_readpage(IndexScanDesc scan, ScanDirection dir,
@@ -1127,16 +1123,16 @@ _bt_steppage(IndexScanDesc scan, ScanDirection dir)
 
 		for (;;)
 		{
-			/* release the previous buffer */
-			_bt_relbuf(rel, so->currPos.buf);
-			so->currPos.buf = InvalidBuffer;
-			/* if we're at end of scan, give up */
+			/* if we're at end of scan, release the buffer and return */
 			if (blkno == P_NONE || !so->currPos.moreRight)
+			{
+				_bt_relbuf(rel, so->currPos.buf);
+				so->currPos.buf = InvalidBuffer;
 				return false;
-			/* check for interrupts while we're not holding any buffer lock */
-			CHECK_FOR_INTERRUPTS();
+			}
 			/* step right one page */
-			so->currPos.buf = _bt_getbuf(rel, blkno, BT_READ);
+			so->currPos.buf = _bt_relandgetbuf(rel, so->currPos.buf,
+											   blkno, BT_READ);
 			/* check for deleted page */
 			page = BufferGetPage(so->currPos.buf);
 			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
@@ -1240,10 +1236,7 @@ _bt_walk_left(Relation rel, Buffer buf)
 		obknum = BufferGetBlockNumber(buf);
 		/* step left */
 		blkno = lblkno = opaque->btpo_prev;
-		_bt_relbuf(rel, buf);
-		/* check for interrupts while we're not holding any buffer lock */
-		CHECK_FOR_INTERRUPTS();
-		buf = _bt_getbuf(rel, blkno, BT_READ);
+		buf = _bt_relandgetbuf(rel, buf, blkno, BT_READ);
 		page = BufferGetPage(buf);
 		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 

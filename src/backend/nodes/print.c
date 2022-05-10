@@ -3,12 +3,12 @@
  * print.c
  *	  various print routines (used mostly for debugging)
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/nodes/print.c,v 1.91 2009/01/01 17:23:43 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/nodes/print.c,v 1.87 2008/01/01 19:45:50 momjian Exp $
  *
  * HISTORY
  *	  AUTHOR			DATE			MAJOR EVENT
@@ -20,12 +20,10 @@
 #include "postgres.h"
 
 #include "access/printtup.h"
-#include "lib/stringinfo.h"
 #include "nodes/print.h"
 #include "optimizer/clauses.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
-#include "utils/rel.h"
 
 
 /*
@@ -272,14 +270,6 @@ print_rt(List *rtable)
 				printf("%d\t%s\t[subquery]",
 					   i, rte->eref->aliasname);
 				break;
-			case RTE_JOIN:
-				printf("%d\t%s\t[join]",
-					   i, rte->eref->aliasname);
-				break;
-			case RTE_SPECIAL:
-				printf("%d\t%s\t[special]",
-					   i, rte->eref->aliasname);
-				break;
 			case RTE_FUNCTION:
 				printf("%d\t%s\t[rangefunction]",
 					   i, rte->eref->aliasname);
@@ -288,8 +278,12 @@ print_rt(List *rtable)
 				printf("%d\t%s\t[values list]",
 					   i, rte->eref->aliasname);
 				break;
-			case RTE_CTE:
-				printf("%d\t%s\t[cte]",
+			case RTE_JOIN:
+				printf("%d\t%s\t[join]",
+					   i, rte->eref->aliasname);
+				break;
+			case RTE_SPECIAL:
+				printf("%d\t%s\t[special]",
 					   i, rte->eref->aliasname);
 				break;
 			default:

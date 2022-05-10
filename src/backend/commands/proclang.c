@@ -3,11 +3,11 @@
  * proclang.c
  *	  PostgreSQL PROCEDURAL LANGUAGE support code.
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/proclang.c,v 1.85 2009/06/11 14:48:56 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/proclang.c,v 1.74 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -22,7 +22,6 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_pltemplate.h"
 #include "catalog/pg_proc.h"
-#include "catalog/pg_proc_fn.h"
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
@@ -34,9 +33,7 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
-#include "utils/rel.h"
 #include "utils/syscache.h"
-#include "utils/tqual.h"
 
 
 typedef struct
@@ -51,8 +48,6 @@ typedef struct
 static void create_proc_lang(const char *languageName,
 				 Oid languageOwner, Oid handlerOid, Oid valOid, bool trusted);
 static PLTemplate *find_language_template(const char *languageName);
-static void AlterLanguageOwner_internal(HeapTuple tup, Relation rel,
-							Oid newOwnerId);
 
 
 /* ---------------------------------------------------------------------
@@ -140,7 +135,6 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 										 pltemplate->tmplhandler,
 										 pltemplate->tmpllibrary,
 										 false, /* isAgg */
-										 false, /* isWindowFunc */
 										 false, /* security_definer */
 										 false, /* isStrict */
 										 PROVOLATILE_VOLATILE,
@@ -148,7 +142,6 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 										 PointerGetDatum(NULL),
 										 PointerGetDatum(NULL),
 										 PointerGetDatum(NULL),
-										 NIL,
 										 PointerGetDatum(NULL),
 										 1,
 										 0);
@@ -175,7 +168,6 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 										 pltemplate->tmplvalidator,
 										 pltemplate->tmpllibrary,
 										 false, /* isAgg */
-										 false, /* isWindowFunc */
 										 false, /* security_definer */
 										 false, /* isStrict */
 										 PROVOLATILE_VOLATILE,
@@ -183,7 +175,6 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 										 PointerGetDatum(NULL),
 										 PointerGetDatum(NULL),
 										 PointerGetDatum(NULL),
-										 NIL,
 										 PointerGetDatum(NULL),
 										 1,
 										 0);
@@ -272,7 +263,7 @@ create_proc_lang(const char *languageName,
 	Relation	rel;
 	TupleDesc	tupDesc;
 	Datum		values[Natts_pg_language];
-	bool		nulls[Natts_pg_language];
+	char		nulls[Natts_pg_language];
 	NameData	langname;
 	HeapTuple	tup;
 	ObjectAddress myself,
@@ -285,7 +276,7 @@ create_proc_lang(const char *languageName,
 	tupDesc = rel->rd_att;
 
 	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
+	memset(nulls, ' ', sizeof(nulls));
 
 	namestrcpy(&langname, languageName);
 	values[Anum_pg_language_lanname - 1] = NameGetDatum(&langname);
@@ -294,9 +285,9 @@ create_proc_lang(const char *languageName,
 	values[Anum_pg_language_lanpltrusted - 1] = BoolGetDatum(trusted);
 	values[Anum_pg_language_lanplcallfoid - 1] = ObjectIdGetDatum(handlerOid);
 	values[Anum_pg_language_lanvalidator - 1] = ObjectIdGetDatum(valOid);
-	nulls[Anum_pg_language_lanacl - 1] = true;
+	nulls[Anum_pg_language_lanacl - 1] = 'n';
 
-	tup = heap_form_tuple(tupDesc, values, nulls);
+	tup = heap_formtuple(tupDesc, values, nulls);
 
 	simple_heap_insert(rel, tup);
 
@@ -369,17 +360,20 @@ find_language_template(const char *languageName)
 		datum = heap_getattr(tup, Anum_pg_pltemplate_tmplhandler,
 							 RelationGetDescr(rel), &isnull);
 		if (!isnull)
-			result->tmplhandler = TextDatumGetCString(datum);
+			result->tmplhandler =
+				DatumGetCString(DirectFunctionCall1(textout, datum));
 
 		datum = heap_getattr(tup, Anum_pg_pltemplate_tmplvalidator,
 							 RelationGetDescr(rel), &isnull);
 		if (!isnull)
-			result->tmplvalidator = TextDatumGetCString(datum);
+			result->tmplvalidator =
+				DatumGetCString(DirectFunctionCall1(textout, datum));
 
 		datum = heap_getattr(tup, Anum_pg_pltemplate_tmpllibrary,
 							 RelationGetDescr(rel), &isnull);
 		if (!isnull)
-			result->tmpllibrary = TextDatumGetCString(datum);
+			result->tmpllibrary =
+				DatumGetCString(DirectFunctionCall1(textout, datum));
 
 		/* Ignore template if handler or library info is missing */
 		if (!result->tmplhandler || !result->tmpllibrary)
@@ -535,6 +529,7 @@ AlterLanguageOwner(const char *name, Oid newOwnerId)
 {
 	HeapTuple	tup;
 	Relation	rel;
+	Form_pg_language lanForm;
 
 	/* Translate name for consistency with CREATE */
 	name = case_translate_language_name(name);
@@ -548,47 +543,6 @@ AlterLanguageOwner(const char *name, Oid newOwnerId)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("language \"%s\" does not exist", name)));
-
-	AlterLanguageOwner_internal(tup, rel, newOwnerId);
-
-	ReleaseSysCache(tup);
-
-	heap_close(rel, RowExclusiveLock);
-
-}
-
-/*
- * Change language owner, specified by OID
- */
-void
-AlterLanguageOwner_oid(Oid oid, Oid newOwnerId)
-{
-	HeapTuple	tup;
-	Relation	rel;
-
-	rel = heap_open(LanguageRelationId, RowExclusiveLock);
-
-	tup = SearchSysCache(LANGOID,
-						 ObjectIdGetDatum(oid),
-						 0, 0, 0);
-	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "cache lookup failed for language %u", oid);
-
-	AlterLanguageOwner_internal(tup, rel, newOwnerId);
-
-	ReleaseSysCache(tup);
-
-	heap_close(rel, RowExclusiveLock);
-}
-
-/*
- * Workhorse for AlterLanguageOwner variants
- */
-static void
-AlterLanguageOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId)
-{
-	Form_pg_language lanForm;
-
 	lanForm = (Form_pg_language) GETSTRUCT(tup);
 
 	/*
@@ -598,8 +552,8 @@ AlterLanguageOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId)
 	if (lanForm->lanowner != newOwnerId)
 	{
 		Datum		repl_val[Natts_pg_language];
-		bool		repl_null[Natts_pg_language];
-		bool		repl_repl[Natts_pg_language];
+		char		repl_null[Natts_pg_language];
+		char		repl_repl[Natts_pg_language];
 		Acl		   *newAcl;
 		Datum		aclDatum;
 		bool		isNull;
@@ -613,10 +567,10 @@ AlterLanguageOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId)
 		/* Must be able to become new owner */
 		check_is_member_of_role(GetUserId(), newOwnerId);
 
-		memset(repl_null, false, sizeof(repl_null));
-		memset(repl_repl, false, sizeof(repl_repl));
+		memset(repl_null, ' ', sizeof(repl_null));
+		memset(repl_repl, ' ', sizeof(repl_repl));
 
-		repl_repl[Anum_pg_language_lanowner - 1] = true;
+		repl_repl[Anum_pg_language_lanowner - 1] = 'r';
 		repl_val[Anum_pg_language_lanowner - 1] = ObjectIdGetDatum(newOwnerId);
 
 		/*
@@ -630,12 +584,12 @@ AlterLanguageOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId)
 		{
 			newAcl = aclnewowner(DatumGetAclP(aclDatum),
 								 lanForm->lanowner, newOwnerId);
-			repl_repl[Anum_pg_language_lanacl - 1] = true;
+			repl_repl[Anum_pg_language_lanacl - 1] = 'r';
 			repl_val[Anum_pg_language_lanacl - 1] = PointerGetDatum(newAcl);
 		}
 
-		newtuple = heap_modify_tuple(tup, RelationGetDescr(rel),
-									 repl_val, repl_null, repl_repl);
+		newtuple = heap_modifytuple(tup, RelationGetDescr(rel),
+									repl_val, repl_null, repl_repl);
 
 		simple_heap_update(rel, &newtuple->t_self, newtuple);
 		CatalogUpdateIndexes(rel, newtuple);
@@ -646,4 +600,7 @@ AlterLanguageOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId)
 		changeDependencyOnOwner(LanguageRelationId, HeapTupleGetOid(tup),
 								newOwnerId);
 	}
+
+	ReleaseSysCache(tup);
+	heap_close(rel, RowExclusiveLock);
 }

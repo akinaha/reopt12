@@ -3,12 +3,12 @@
  * hashscan.c
  *	  manage scans on hash tables
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/hash/hashscan.c,v 1.47 2009/06/11 14:48:53 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/access/hash/hashscan.c,v 1.43 2008/01/01 19:45:46 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -16,22 +16,9 @@
 #include "postgres.h"
 
 #include "access/hash.h"
-#include "access/relscan.h"
-#include "utils/memutils.h"
-#include "utils/rel.h"
 #include "utils/resowner.h"
 
 
-/*
- * We track all of a backend's active scans on hash indexes using a list
- * of HashScanListData structs, which are allocated in TopMemoryContext.
- * It's okay to use a long-lived context because we rely on the ResourceOwner
- * mechanism to clean up unused entries after transaction or subtransaction
- * abort.  We can't safely keep the entries in the executor's per-query
- * context, because that might be already freed before we get a chance to
- * clean up the list.  (XXX seems like there should be a better way to
- * manage this...)
- */
 typedef struct HashScanListData
 {
 	IndexScanDesc hashsl_scan;
@@ -57,11 +44,6 @@ ReleaseResources_hash(void)
 	HashScanList next;
 
 	/*
-	 * Release all HashScanList items belonging to the current ResourceOwner.
-	 * Note that we do not release the underlying IndexScanDesc; that's in
-	 * executor memory and will go away on its own (in fact quite possibly has
-	 * gone away already, so we mustn't try to touch it here).
-	 *
 	 * Note: this should be a no-op during normal query shutdown. However, in
 	 * an abort situation ExecutorEnd is not called and so there may be open
 	 * index scans to clean up.
@@ -87,15 +69,14 @@ ReleaseResources_hash(void)
 }
 
 /*
- *	_hash_regscan() -- register a new scan.
+ *	_Hash_regscan() -- register a new scan.
  */
 void
 _hash_regscan(IndexScanDesc scan)
 {
 	HashScanList new_el;
 
-	new_el = (HashScanList) MemoryContextAlloc(TopMemoryContext,
-											   sizeof(HashScanListData));
+	new_el = (HashScanList) palloc(sizeof(HashScanListData));
 	new_el->hashsl_scan = scan;
 	new_el->hashsl_owner = CurrentResourceOwner;
 	new_el->hashsl_next = HashScans;

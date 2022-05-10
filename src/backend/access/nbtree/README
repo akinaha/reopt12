@@ -1,7 +1,4 @@
-$PostgreSQL: pgsql/src/backend/access/nbtree/README,v 1.20 2008/03/21 13:23:27 momjian Exp $
-
-Btree Indexing
-==============
+$PostgreSQL: pgsql/src/backend/access/nbtree/README,v 1.18 2007/09/12 22:10:26 tgl Exp $
 
 This directory contains a correct implementation of Lehman and Yao's
 high-concurrency B-tree management algorithm (P. Lehman and S. Yao,
@@ -11,7 +8,7 @@ use a simplified version of the deletion logic described in Lanin and
 Shasha (V. Lanin and D. Shasha, A Symmetric Concurrent B-Tree Algorithm,
 Proceedings of 1986 Fall Joint Computer Conference, pp 380-389).
 
-The Lehman and Yao Algorithm and Insertions
+The Lehman and Yao algorithm and insertions
 -------------------------------------------
 
 We have made the following changes in order to incorporate the L&Y algorithm
@@ -128,7 +125,7 @@ each of the resulting pages.  Note we must include the incoming item in
 this calculation, otherwise it is possible to find that the incoming
 item doesn't fit on the split page where it needs to go!
 
-The Deletion Algorithm
+The deletion algorithm
 ----------------------
 
 Before deleting a leaf item, we get a super-exclusive lock on the target
@@ -323,7 +320,7 @@ positives, so long as it never gives a false negative.  This makes it
 possible to implement the test with a small counter value stored on each
 index page.
 
-On-the-Fly Deletion Of Index Tuples
+On-the-fly deletion of index tuples
 -----------------------------------
 
 If a process visits a heap tuple and finds that it's dead and removable
@@ -360,7 +357,7 @@ and so cannot remove the heap tuple.  This is another reason why
 btbulkdelete has to get super-exclusive lock on every leaf page, not only
 the ones where it actually sees items to delete.
 
-WAL Considerations
+WAL considerations
 ------------------
 
 The insertion and deletion algorithms in themselves don't guarantee btree
@@ -401,7 +398,7 @@ of the WAL entry.)  If the parent page becomes half-dead but is not
 immediately deleted due to a subsequent crash, there is no loss of
 consistency, and the empty page will be picked up by the next VACUUM.
 
-Other Things That Are Handy to Know
+Other things that are handy to know
 -----------------------------------
 
 Page zero of every btree is a meta-data page.  This page stores the
@@ -446,7 +443,7 @@ original search scankey is consulted as each index entry is sequentially
 scanned to decide whether to return the entry and whether the scan can
 stop (see _bt_checkkeys()).
 
-Notes About Data Representation
+Notes about data representation
 -------------------------------
 
 The right-sibling link required by L&Y is kept in the page "opaque
@@ -480,7 +477,7 @@ item is irrelevant, and need not be stored at all.  This arrangement
 corresponds to the fact that an L&Y non-leaf page has one more pointer
 than key.
 
-Notes to Operator Class Implementors
+Notes to operator class implementors
 ------------------------------------
 
 With this implementation, we require each supported combination of

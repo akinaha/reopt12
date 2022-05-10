@@ -6,12 +6,12 @@
  * There is hardly anything left of Paul Brown's original implementation...
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/cluster.c,v 1.186.2.1 2010/02/02 19:12:34 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/cluster.c,v 1.169 2008/01/30 19:46:48 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -19,7 +19,6 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
-#include "access/relscan.h"
 #include "access/rewriteheap.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -29,14 +28,12 @@
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
-#include "catalog/pg_namespace.h"
 #include "catalog/toasting.h"
 #include "commands/cluster.h"
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
-#include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
 #include "utils/fmgroids.h"
@@ -44,9 +41,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/relcache.h"
-#include "utils/snapmgr.h"
 #include "utils/syscache.h"
-#include "utils/tqual.h"
 
 
 /*
@@ -61,7 +56,7 @@ typedef struct
 } RelToCluster;
 
 
-static void cluster_rel(RelToCluster *rv, bool recheck, bool verbose);
+static void cluster_rel(RelToCluster *rv, bool recheck);
 static void rebuild_relation(Relation OldHeap, Oid indexOid);
 static TransactionId copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex);
 static List *get_tables_to_cluster(MemoryContext cluster_context);
@@ -117,7 +112,7 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
 		 * Reject clustering a remote temp table ... their local buffer
 		 * manager is not going to cope.
 		 */
-		if (RELATION_IS_OTHER_TEMP(rel))
+		if (isOtherTempNamespace(RelationGetNamespace(rel)))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			   errmsg("cannot cluster temporary tables of other sessions")));
@@ -177,7 +172,7 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
 		heap_close(rel, NoLock);
 
 		/* Do the job */
-		cluster_rel(&rvtc, false, stmt->verbose);
+		cluster_rel(&rvtc, false);
 	}
 	else
 	{
@@ -214,7 +209,6 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
 		rvs = get_tables_to_cluster(cluster_context);
 
 		/* Commit to get out of starting transaction */
-		PopActiveSnapshot();
 		CommitTransactionCommand();
 
 		/* Ok, now that we've got them all, cluster them one by one */
@@ -225,9 +219,8 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
 			/* Start a new transaction for each relation. */
 			StartTransactionCommand();
 			/* functions in indexes may want a snapshot set */
-			PushActiveSnapshot(GetTransactionSnapshot());
-			cluster_rel(rvtc, true, stmt->verbose);
-			PopActiveSnapshot();
+			ActiveSnapshot = CopySnapshot(GetTransactionSnapshot());
+			cluster_rel(rvtc, true);
 			CommitTransactionCommand();
 		}
 
@@ -254,7 +247,7 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
  * them incrementally while we load the table.
  */
 static void
-cluster_rel(RelToCluster *rvtc, bool recheck, bool verbose)
+cluster_rel(RelToCluster *rvtc, bool recheck)
 {
 	Relation	OldHeap;
 
@@ -302,7 +295,7 @@ cluster_rel(RelToCluster *rvtc, bool recheck, bool verbose)
 		 * check_index_is_clusterable which is redundant, but we leave it for
 		 * extra safety.
 		 */
-		if (RELATION_IS_OTHER_TEMP(OldHeap))
+		if (isOtherTempNamespace(RelationGetNamespace(OldHeap)))
 		{
 			relation_close(OldHeap, AccessExclusiveLock);
 			return;
@@ -344,10 +337,6 @@ cluster_rel(RelToCluster *rvtc, bool recheck, bool verbose)
 	check_index_is_clusterable(OldHeap, rvtc->indexOid, recheck);
 
 	/* rebuild_relation does all the dirty work */
-	ereport(verbose ? INFO : DEBUG2,
-			(errmsg("clustering \"%s.%s\"",
-					get_namespace_name(RelationGetNamespace(OldHeap)),
-					RelationGetRelationName(OldHeap))));
 	rebuild_relation(OldHeap, rvtc->indexOid);
 
 	/* NB: rebuild_relation does heap_close() on OldHeap */
@@ -465,7 +454,7 @@ check_index_is_clusterable(Relation OldHeap, Oid indexOid, bool recheck)
 	 * Don't allow cluster on temp tables of other backends ... their local
 	 * buffer manager is not going to cope.
 	 */
-	if (RELATION_IS_OTHER_TEMP(OldHeap))
+	if (isOtherTempNamespace(RelationGetNamespace(OldHeap)))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			   errmsg("cannot cluster temporary tables of other sessions")));
@@ -573,7 +562,6 @@ rebuild_relation(Relation OldHeap, Oid indexOid)
 	char		NewHeapName[NAMEDATALEN];
 	TransactionId frozenXid;
 	ObjectAddress object;
-	Relation	newrel;
 
 	/* Mark the correct index as clustered */
 	mark_index_clustered(OldHeap, indexOid);
@@ -628,40 +616,6 @@ rebuild_relation(Relation OldHeap, Oid indexOid)
 	 * because reindex_relation does it.
 	 */
 	reindex_relation(tableOid, false);
-
-	/*
-	 * At this point, everything is kosher except that the toast table's name
-	 * corresponds to the temporary table.	The name is irrelevant to the
-	 * backend because it's referenced by OID, but users looking at the
-	 * catalogs could be confused.	Rename it to prevent this problem.
-	 *
-	 * Note no lock required on the relation, because we already hold an
-	 * exclusive lock on it.
-	 */
-	newrel = heap_open(tableOid, NoLock);
-	if (OidIsValid(newrel->rd_rel->reltoastrelid))
-	{
-		Relation	toastrel;
-		Oid			toastidx;
-		Oid			toastnamespace;
-		char		NewToastName[NAMEDATALEN];
-
-		toastrel = relation_open(newrel->rd_rel->reltoastrelid, AccessShareLock);
-		toastidx = toastrel->rd_rel->reltoastidxid;
-		toastnamespace = toastrel->rd_rel->relnamespace;
-		relation_close(toastrel, AccessShareLock);
-
-		/* rename the toast table ... */
-		snprintf(NewToastName, NAMEDATALEN, "pg_toast_%u", tableOid);
-		RenameRelationInternal(newrel->rd_rel->reltoastrelid, NewToastName,
-							   toastnamespace);
-
-		/* ... and its index too */
-		snprintf(NewToastName, NAMEDATALEN, "pg_toast_%u_index", tableOid);
-		RenameRelationInternal(toastidx, NewToastName,
-							   toastnamespace);
-	}
-	relation_close(newrel, NoLock);
 }
 
 /*
@@ -673,7 +627,6 @@ make_new_heap(Oid OIDOldHeap, const char *NewName, Oid NewTableSpace)
 	TupleDesc	OldHeapDesc,
 				tupdesc;
 	Oid			OIDNewHeap;
-	Oid			toastid;
 	Relation	OldHeap;
 	HeapTuple	tuple;
 	Datum		reloptions;
@@ -684,12 +637,9 @@ make_new_heap(Oid OIDOldHeap, const char *NewName, Oid NewTableSpace)
 
 	/*
 	 * Need to make a copy of the tuple descriptor, since
-	 * heap_create_with_catalog modifies it.  Note that the NewHeap will not
-	 * receive any of the defaults or constraints associated with the OldHeap;
-	 * we don't need 'em, and there's no reason to spend cycles inserting them
-	 * into the catalogs only to delete them.
+	 * heap_create_with_catalog modifies it.
 	 */
-	tupdesc = CreateTupleDescCopy(OldHeapDesc);
+	tupdesc = CreateTupleDescCopyConstr(OldHeapDesc);
 
 	/*
 	 * Use options of the old heap for new heap.
@@ -710,7 +660,6 @@ make_new_heap(Oid OIDOldHeap, const char *NewName, Oid NewTableSpace)
 										  InvalidOid,
 										  OldHeap->rd_rel->relowner,
 										  tupdesc,
-										  NIL,
 										  OldHeap->rd_rel->relkind,
 										  OldHeap->rd_rel->relisshared,
 										  true,
@@ -732,24 +681,7 @@ make_new_heap(Oid OIDOldHeap, const char *NewName, Oid NewTableSpace)
 	 * AlterTableCreateToastTable ends with CommandCounterIncrement(), so that
 	 * the TOAST table will be visible for insertion.
 	 */
-	toastid = OldHeap->rd_rel->reltoastrelid;
-	reloptions = (Datum) 0;
-	if (OidIsValid(toastid))
-	{
-		tuple = SearchSysCache(RELOID,
-							   ObjectIdGetDatum(toastid),
-							   0, 0, 0);
-		if (!HeapTupleIsValid(tuple))
-			elog(ERROR, "cache lookup failed for relation %u", toastid);
-		reloptions = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions,
-									 &isNull);
-		if (isNull)
-			reloptions = (Datum) 0;
-	}
-	AlterTableCreateToastTable(OIDNewHeap, InvalidOid, reloptions, false);
-
-	if (OidIsValid(toastid))
-		ReleaseSysCache(tuple);
+	AlterTableCreateToastTable(OIDNewHeap);
 
 	heap_close(OldHeap, NoLock);
 
@@ -812,12 +744,12 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex)
 	 * freeze_min_age to avoid having CLUSTER freeze tuples earlier than a
 	 * plain VACUUM would.
 	 */
-	vacuum_set_xid_limits(-1, -1, OldHeap->rd_rel->relisshared,
-						  &OldestXmin, &FreezeXid, NULL);
+	vacuum_set_xid_limits(-1, OldHeap->rd_rel->relisshared,
+						  &OldestXmin, &FreezeXid);
 
 	/*
-	 * FreezeXid will become the table's new relfrozenxid, and that mustn't go
-	 * backwards, so take the max.
+	 * FreezeXid will become the table's new relfrozenxid, and that mustn't
+	 * go backwards, so take the max.
 	 */
 	if (TransactionIdPrecedes(FreezeXid, OldHeap->rd_rel->relfrozenxid))
 		FreezeXid = OldHeap->rd_rel->relfrozenxid;
@@ -841,10 +773,6 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex)
 		int			i;
 
 		CHECK_FOR_INTERRUPTS();
-
-		/* Since we used no scan keys, should never need to recheck */
-		if (scan->xs_recheck)
-			elog(ERROR, "CLUSTER does not support lossy index conditions");
 
 		LockBuffer(scan->xs_cbuf, BUFFER_LOCK_SHARE);
 

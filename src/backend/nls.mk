@@ -1,8 +1,10 @@
-# $PostgreSQL: pgsql/src/backend/nls.mk,v 1.27 2009/06/26 19:33:43 petere Exp $
+# $PostgreSQL: pgsql/src/backend/nls.mk,v 1.21 2008/01/30 11:05:37 petere Exp $
 CATALOG_NAME	:= postgres
-AVAIL_LANGUAGES	:= de es fr ja pt_BR tr
+AVAIL_LANGUAGES	:= af cs de es fr hr hu it ko nb nl pt_BR ro ru sk sl sv tr zh_CN zh_TW
 GETTEXT_FILES	:= + gettext-files
-GETTEXT_TRIGGERS:= _ errmsg errmsg_plural:1,2 errdetail errdetail_log errdetail_plural:1,2 errhint errcontext write_stderr yyerror
+# you can add "elog:2" and "errmsg_internal" to this list if you want to
+# include internal messages in the translation list.
+GETTEXT_TRIGGERS:= _ errmsg errdetail errhint errcontext write_stderr yyerror
 
 gettext-files: distprep
 	find $(srcdir)/ $(srcdir)/../port/ -name '*.c' -print >$@

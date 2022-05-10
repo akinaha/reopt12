@@ -3,12 +3,12 @@
  * nodeLimit.c
  *	  Routines to handle limiting of query results where appropriate
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeLimit.c,v 1.39 2009/06/11 14:48:57 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/executor/nodeLimit.c,v 1.33 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -246,9 +246,7 @@ recompute_limits(LimitState *node)
 		{
 			node->offset = DatumGetInt64(val);
 			if (node->offset < 0)
-				ereport(ERROR,
-				 (errcode(ERRCODE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE),
-				  errmsg("OFFSET must not be negative")));
+				node->offset = 0;
 		}
 	}
 	else
@@ -273,9 +271,7 @@ recompute_limits(LimitState *node)
 		{
 			node->count = DatumGetInt64(val);
 			if (node->count < 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE),
-						 errmsg("LIMIT must not be negative")));
+				node->count = 0;
 			node->noCount = false;
 		}
 	}

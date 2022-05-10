@@ -3,12 +3,12 @@
  * nbtutils.c
  *	  Utility code for Postgres btree implementation.
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/nbtree/nbtutils.c,v 1.93 2009/01/05 17:14:28 alvherre Exp $
+ *	  $PostgreSQL: pgsql/src/backend/access/nbtree/nbtutils.c,v 1.88 2008/01/01 19:45:46 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -20,10 +20,8 @@
 #include "access/genam.h"
 #include "access/nbtree.h"
 #include "access/reloptions.h"
-#include "access/relscan.h"
 #include "executor/execdebug.h"
 #include "miscadmin.h"
-#include "storage/bufmgr.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/lsyscache.h"
@@ -1254,11 +1252,8 @@ _bt_vacuum_cycleid(Relation rel)
 /*
  * _bt_start_vacuum --- assign a cycle ID to a just-starting VACUUM operation
  *
- * Note: the caller must guarantee that it will eventually call
- * _bt_end_vacuum, else we'll permanently leak an array slot.  To ensure
- * that this happens even in elog(FATAL) scenarios, the appropriate coding
- * is not just a PG_TRY, but
- *		PG_ENSURE_ERROR_CLEANUP(_bt_end_vacuum_callback, PointerGetDatum(rel))
+ * Note: the caller must guarantee (via PG_TRY) that it will eventually call
+ * _bt_end_vacuum, else we'll permanently leak an array slot.
  */
 BTCycleId
 _bt_start_vacuum(Relation rel)
@@ -1343,15 +1338,6 @@ _bt_end_vacuum(Relation rel)
 }
 
 /*
- * _bt_end_vacuum wrapped as an on_shmem_exit callback function
- */
-void
-_bt_end_vacuum_callback(int code, Datum arg)
-{
-	_bt_end_vacuum((Relation) DatumGetPointer(arg));
-}
-
-/*
  * BTreeShmemSize --- report amount of shared memory space needed
  */
 Size
@@ -1402,7 +1388,9 @@ btoptions(PG_FUNCTION_ARGS)
 	bool		validate = PG_GETARG_BOOL(1);
 	bytea	   *result;
 
-	result = default_reloptions(reloptions, validate, RELOPT_KIND_BTREE);
+	result = default_reloptions(reloptions, validate,
+								BTREE_MIN_FILLFACTOR,
+								BTREE_DEFAULT_FILLFACTOR);
 	if (result)
 		PG_RETURN_BYTEA_P(result);
 	PG_RETURN_NULL();

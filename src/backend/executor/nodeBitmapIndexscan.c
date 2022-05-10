@@ -3,12 +3,12 @@
  * nodeBitmapIndexscan.c
  *	  Routines to support bitmapped index scans of relations
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeBitmapIndexscan.c,v 1.30.2.1 2009/07/18 19:15:50 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/executor/nodeBitmapIndexscan.c,v 1.25 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -37,8 +37,11 @@
 Node *
 MultiExecBitmapIndexScan(BitmapIndexScanState *node)
 {
+#define MAX_TIDS	1024
 	TIDBitmap  *tbm;
 	IndexScanDesc scandesc;
+	ItemPointerData tids[MAX_TIDS];
+	int32		ntids;
 	double		nTuples = 0;
 	bool		doscan;
 
@@ -88,14 +91,23 @@ MultiExecBitmapIndexScan(BitmapIndexScanState *node)
 	 */
 	while (doscan)
 	{
-		nTuples += (double) index_getbitmap(scandesc, tbm);
+		bool		more = index_getmulti(scandesc, tids, MAX_TIDS, &ntids);
+
+		if (ntids > 0)
+		{
+			tbm_add_tuples(tbm, tids, ntids);
+			nTuples += ntids;
+		}
 
 		CHECK_FOR_INTERRUPTS();
 
-		doscan = ExecIndexAdvanceArrayKeys(node->biss_ArrayKeys,
-										   node->biss_NumArrayKeys);
-		if (doscan)				/* reset index scan */
-			index_rescan(node->biss_ScanDesc, node->biss_ScanKeys);
+		if (!more)
+		{
+			doscan = ExecIndexAdvanceArrayKeys(node->biss_ArrayKeys,
+											   node->biss_NumArrayKeys);
+			if (doscan)			/* reset index scan */
+				index_rescan(node->biss_ScanDesc, node->biss_ScanKeys);
+		}
 	}
 
 	/* must provide our own instrumentation support */
@@ -182,7 +194,7 @@ ExecEndBitmapIndexScan(BitmapIndexScanState *node)
 	 */
 #ifdef NOT_USED
 	if (node->biss_RuntimeContext)
-		FreeExprContext(node->biss_RuntimeContext, true);
+		FreeExprContext(node->biss_RuntimeContext);
 #endif
 
 	/*
@@ -275,8 +287,9 @@ ExecInitBitmapIndexScan(BitmapIndexScan *node, EState *estate, int eflags)
 	 */
 	ExecIndexBuildScanKeys((PlanState *) indexstate,
 						   indexstate->biss_RelationDesc,
-						   node->scan.scanrelid,
 						   node->indexqual,
+						   node->indexstrategy,
+						   node->indexsubtype,
 						   &indexstate->biss_ScanKeys,
 						   &indexstate->biss_NumScanKeys,
 						   &indexstate->biss_RuntimeKeys,
@@ -308,10 +321,10 @@ ExecInitBitmapIndexScan(BitmapIndexScan *node, EState *estate, int eflags)
 	 * Initialize scan descriptor.
 	 */
 	indexstate->biss_ScanDesc =
-		index_beginscan_bitmap(indexstate->biss_RelationDesc,
-							   estate->es_snapshot,
-							   indexstate->biss_NumScanKeys,
-							   indexstate->biss_ScanKeys);
+		index_beginscan_multi(indexstate->biss_RelationDesc,
+							  estate->es_snapshot,
+							  indexstate->biss_NumScanKeys,
+							  indexstate->biss_ScanKeys);
 
 	/*
 	 * all done.

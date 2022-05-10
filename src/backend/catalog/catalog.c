@@ -5,12 +5,12 @@
  *		bits of hard-wired knowledge
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/catalog/catalog.c,v 1.83 2009/06/11 14:48:54 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/catalog/catalog.c,v 1.72 2008/01/01 19:45:48 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -21,7 +21,6 @@
 #include <unistd.h>
 
 #include "access/genam.h"
-#include "access/sysattr.h"
 #include "access/transam.h"
 #include "catalog/catalog.h"
 #include "catalog/indexing.h"
@@ -38,44 +37,11 @@
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/fmgroids.h"
-#include "utils/rel.h"
-#include "utils/tqual.h"
+#include "utils/relcache.h"
 
 
-#define OIDCHARS		10		/* max chars printed by %u */
-#define FORKNAMECHARS	4		/* max chars for a fork name */
+#define OIDCHARS	10			/* max chars printed by %u */
 
-/*
- * Lookup table of fork name by fork number.
- *
- * If you add a new entry, remember to update the errhint below, and the
- * documentation for pg_relation_size(). Also keep FORKNAMECHARS above
- * up-to-date.
- */
-const char *forkNames[] = {
-	"main",						/* MAIN_FORKNUM */
-	"fsm",						/* FSM_FORKNUM */
-	"vm"						/* VISIBILITYMAP_FORKNUM */
-};
-
-/*
- * forkname_to_number - look up fork number by name
- */
-ForkNumber
-forkname_to_number(char *forkName)
-{
-	ForkNumber	forkNum;
-
-	for (forkNum = 0; forkNum <= MAX_FORKNUM; forkNum++)
-		if (strcmp(forkNames[forkNum], forkName) == 0)
-			return forkNum;
-
-	ereport(ERROR,
-			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("invalid fork name"),
-			 errhint("Valid fork names are \"main\", \"fsm\", and \"vm\".")));
-	return InvalidForkNumber;	/* keep compiler quiet */
-}
 
 /*
  * relpath			- construct path to a relation's file
@@ -83,7 +49,7 @@ forkname_to_number(char *forkName)
  * Result is a palloc'd string.
  */
 char *
-relpath(RelFileNode rnode, ForkNumber forknum)
+relpath(RelFileNode rnode)
 {
 	int			pathlen;
 	char	   *path;
@@ -92,39 +58,26 @@ relpath(RelFileNode rnode, ForkNumber forknum)
 	{
 		/* Shared system relations live in {datadir}/global */
 		Assert(rnode.dbNode == 0);
-		pathlen = 7 + OIDCHARS + 1 + FORKNAMECHARS + 1;
+		pathlen = 7 + OIDCHARS + 1;
 		path = (char *) palloc(pathlen);
-		if (forknum != MAIN_FORKNUM)
-			snprintf(path, pathlen, "global/%u_%s",
-					 rnode.relNode, forkNames[forknum]);
-		else
-			snprintf(path, pathlen, "global/%u", rnode.relNode);
+		snprintf(path, pathlen, "global/%u",
+				 rnode.relNode);
 	}
 	else if (rnode.spcNode == DEFAULTTABLESPACE_OID)
 	{
 		/* The default tablespace is {datadir}/base */
-		pathlen = 5 + OIDCHARS + 1 + OIDCHARS + 1 + FORKNAMECHARS + 1;
+		pathlen = 5 + OIDCHARS + 1 + OIDCHARS + 1;
 		path = (char *) palloc(pathlen);
-		if (forknum != MAIN_FORKNUM)
-			snprintf(path, pathlen, "base/%u/%u_%s",
-					 rnode.dbNode, rnode.relNode, forkNames[forknum]);
-		else
-			snprintf(path, pathlen, "base/%u/%u",
-					 rnode.dbNode, rnode.relNode);
+		snprintf(path, pathlen, "base/%u/%u",
+				 rnode.dbNode, rnode.relNode);
 	}
 	else
 	{
 		/* All other tablespaces are accessed via symlinks */
-		pathlen = 10 + OIDCHARS + 1 + OIDCHARS + 1 + OIDCHARS + 1
-			+ FORKNAMECHARS + 1;
+		pathlen = 10 + OIDCHARS + 1 + OIDCHARS + 1 + OIDCHARS + 1;
 		path = (char *) palloc(pathlen);
-		if (forknum != MAIN_FORKNUM)
-			snprintf(path, pathlen, "pg_tblspc/%u/%u/%u_%s",
-					 rnode.spcNode, rnode.dbNode, rnode.relNode,
-					 forkNames[forknum]);
-		else
-			snprintf(path, pathlen, "pg_tblspc/%u/%u/%u",
-					 rnode.spcNode, rnode.dbNode, rnode.relNode);
+		snprintf(path, pathlen, "pg_tblspc/%u/%u/%u",
+				 rnode.spcNode, rnode.dbNode, rnode.relNode);
 	}
 	return path;
 }
@@ -358,7 +311,9 @@ IsSharedRelation(Oid relationId)
 Oid
 GetNewOid(Relation relation)
 {
+	Oid			newOid;
 	Oid			oidIndex;
+	Relation	indexrel;
 
 	/* If relation doesn't have OIDs at all, caller is confused */
 	Assert(relation->rd_rel->relhasoids);
@@ -386,7 +341,11 @@ GetNewOid(Relation relation)
 	}
 
 	/* Otherwise, use the index to find a nonconflicting OID */
-	return GetNewOidWithIndex(relation, oidIndex, ObjectIdAttributeNumber);
+	indexrel = index_open(oidIndex, AccessShareLock);
+	newOid = GetNewOidWithIndex(relation, indexrel);
+	index_close(indexrel, AccessShareLock);
+
+	return newOid;
 }
 
 /*
@@ -397,17 +356,16 @@ GetNewOid(Relation relation)
  * an index that will not be recognized by RelationGetOidIndex: TOAST tables
  * and pg_largeobject have indexes that are usable, but have multiple columns
  * and are on ordinary columns rather than a true OID column.  This code
- * will work anyway, so long as the OID is the index's first column.  The
- * caller must pass in the actual heap attnum of the OID column, however.
+ * will work anyway, so long as the OID is the index's first column.
  *
  * Caller must have a suitable lock on the relation.
  */
 Oid
-GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
+GetNewOidWithIndex(Relation relation, Relation indexrel)
 {
 	Oid			newOid;
 	SnapshotData SnapshotDirty;
-	SysScanDesc scan;
+	IndexScanDesc scan;
 	ScanKeyData key;
 	bool		collides;
 
@@ -416,22 +374,20 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 	/* Generate new OIDs until we find one not in the table */
 	do
 	{
-		CHECK_FOR_INTERRUPTS();
-
 		newOid = GetNewObjectId();
 
 		ScanKeyInit(&key,
-					oidcolumn,
+					(AttrNumber) 1,
 					BTEqualStrategyNumber, F_OIDEQ,
 					ObjectIdGetDatum(newOid));
 
 		/* see notes above about using SnapshotDirty */
-		scan = systable_beginscan(relation, indexId, true,
-								  &SnapshotDirty, 1, &key);
+		scan = index_beginscan(relation, indexrel,
+							   &SnapshotDirty, 1, &key);
 
-		collides = HeapTupleIsValid(systable_getnext(scan));
+		collides = HeapTupleIsValid(index_getnext(scan, ForwardScanDirection));
 
-		systable_endscan(scan);
+		index_endscan(scan);
 	} while (collides);
 
 	return newOid;
@@ -467,8 +423,6 @@ GetNewRelFileNode(Oid reltablespace, bool relisshared, Relation pg_class)
 
 	do
 	{
-		CHECK_FOR_INTERRUPTS();
-
 		/* Generate the OID */
 		if (pg_class)
 			rnode.relNode = GetNewOid(pg_class);
@@ -476,7 +430,7 @@ GetNewRelFileNode(Oid reltablespace, bool relisshared, Relation pg_class)
 			rnode.relNode = GetNewObjectId();
 
 		/* Check for existing file of same name */
-		rpath = relpath(rnode, MAIN_FORKNUM);
+		rpath = relpath(rnode);
 		fd = BasicOpenFile(rpath, O_RDONLY | PG_BINARY, 0);
 
 		if (fd >= 0)

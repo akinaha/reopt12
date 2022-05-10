@@ -3,12 +3,12 @@
  * sequence.c
  *	  PostgreSQL sequences support code.
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/sequence.c,v 1.160 2009/06/11 14:48:56 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/sequence.c,v 1.149 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -17,7 +17,6 @@
 #include "access/heapam.h"
 #include "access/transam.h"
 #include "access/xact.h"
-#include "access/xlogutils.h"
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
@@ -26,8 +25,6 @@
 #include "commands/tablecmds.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
-#include "storage/bufmgr.h"
-#include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -109,12 +106,12 @@ DefineSequence(CreateSeqStmt *seq)
 	Oid			seqoid;
 	Relation	rel;
 	Buffer		buf;
-	Page		page;
+	PageHeader	page;
 	sequence_magic *sm;
 	HeapTuple	tuple;
 	TupleDesc	tupDesc;
 	Datum		value[SEQ_COL_LASTCOL];
-	bool		null[SEQ_COL_LASTCOL];
+	char		null[SEQ_COL_LASTCOL];
 	int			i;
 	NameData	name;
 
@@ -122,7 +119,7 @@ DefineSequence(CreateSeqStmt *seq)
 	init_params(seq->options, true, &new, &owned_by);
 
 	/*
-	 * Create relation (and fill value[] and null[] for the tuple)
+	 * Create relation (and fill *null & *value)
 	 */
 	stmt->tableElts = NIL;
 	for (i = SEQ_COL_FIRSTCOL; i <= SEQ_COL_LASTCOL; i++)
@@ -136,7 +133,7 @@ DefineSequence(CreateSeqStmt *seq)
 		coldef->cooked_default = NULL;
 		coldef->constraints = NIL;
 
-		null[i - 1] = false;
+		null[i - 1] = ' ';
 
 		switch (i)
 		{
@@ -150,11 +147,6 @@ DefineSequence(CreateSeqStmt *seq)
 				coldef->typename = makeTypeNameFromOid(INT8OID, -1);
 				coldef->colname = "last_value";
 				value[i - 1] = Int64GetDatumFast(new.last_value);
-				break;
-			case SEQ_COL_STARTVAL:
-				coldef->typename = makeTypeNameFromOid(INT8OID, -1);
-				coldef->colname = "start_value";
-				value[i - 1] = Int64GetDatumFast(new.start_value);
 				break;
 			case SEQ_COL_INCBY:
 				coldef->typename = makeTypeNameFromOid(INT8OID, -1);
@@ -212,9 +204,9 @@ DefineSequence(CreateSeqStmt *seq)
 	buf = ReadBuffer(rel, P_NEW);
 	Assert(BufferGetBlockNumber(buf) == 0);
 
-	page = BufferGetPage(buf);
+	page = (PageHeader) BufferGetPage(buf);
 
-	PageInit(page, BufferGetPageSize(buf), sizeof(sequence_magic));
+	PageInit((Page) page, BufferGetPageSize(buf), sizeof(sequence_magic));
 	sm = (sequence_magic *) PageGetSpecialPointer(page);
 	sm->magic = SEQ_MAGIC;
 
@@ -222,7 +214,7 @@ DefineSequence(CreateSeqStmt *seq)
 	rel->rd_targblock = 0;
 
 	/* Now form & insert sequence tuple */
-	tuple = heap_form_tuple(tupDesc, value, null);
+	tuple = heap_formtuple(tupDesc, value, null);
 	simple_heap_insert(rel, tuple);
 
 	Assert(ItemPointerGetOffsetNumber(&(tuple->t_self)) == FirstOffsetNumber);
@@ -249,7 +241,7 @@ DefineSequence(CreateSeqStmt *seq)
 	{
 		/*
 		 * Note that the "tuple" structure is still just a local tuple record
-		 * created by heap_form_tuple; its t_data pointer doesn't point at the
+		 * created by heap_formtuple; its t_data pointer doesn't point at the
 		 * disk buffer.  To scribble on the disk buffer we need to fetch the
 		 * item pointer.  But do the same to the local tuple, since that will
 		 * be the source for the WAL log record, below.
@@ -319,29 +311,6 @@ void
 AlterSequence(AlterSeqStmt *stmt)
 {
 	Oid			relid;
-
-	/* find sequence */
-	relid = RangeVarGetRelid(stmt->sequence, false);
-
-	/* allow ALTER to sequence owner only */
-	/* if you change this, see also callers of AlterSequenceInternal! */
-	if (!pg_class_ownercheck(relid, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_CLASS,
-					   stmt->sequence->relname);
-
-	/* do the work */
-	AlterSequenceInternal(relid, stmt->options);
-}
-
-/*
- * AlterSequenceInternal
- *
- * Same as AlterSequence except that the sequence is specified by OID
- * and we assume the caller already checked permissions.
- */
-void
-AlterSequenceInternal(Oid relid, List *options)
-{
 	SeqTable	elm;
 	Relation	seqrel;
 	Buffer		buf;
@@ -351,7 +320,13 @@ AlterSequenceInternal(Oid relid, List *options)
 	List	   *owned_by;
 
 	/* open and AccessShareLock sequence */
+	relid = RangeVarGetRelid(stmt->sequence, false);
 	init_sequence(relid, &elm, &seqrel);
+
+	/* allow ALTER to sequence owner only */
+	if (!pg_class_ownercheck(elm->relid, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_CLASS,
+					   stmt->sequence->relname);
 
 	/* lock page' buffer and read tuple into new sequence structure */
 	seq = read_info(elm, seqrel, &buf);
@@ -361,7 +336,7 @@ AlterSequenceInternal(Oid relid, List *options)
 	memcpy(&new, seq, sizeof(FormData_pg_sequence));
 
 	/* Check and set new values */
-	init_params(options, false, &new, &owned_by);
+	init_params(stmt->options, false, &new, &owned_by);
 
 	/* Clear local cache so that we don't think we have cached numbers */
 	/* Note that we do not change the currval() state */
@@ -954,7 +929,7 @@ init_sequence(Oid relid, SeqTable *p_elm, Relation *p_rel)
 static Form_pg_sequence
 read_info(SeqTable elm, Relation rel, Buffer *buf)
 {
-	Page		page;
+	PageHeader	page;
 	ItemId		lp;
 	HeapTupleData tuple;
 	sequence_magic *sm;
@@ -963,7 +938,7 @@ read_info(SeqTable elm, Relation rel, Buffer *buf)
 	*buf = ReadBuffer(rel, 0);
 	LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
 
-	page = BufferGetPage(*buf);
+	page = (PageHeader) BufferGetPage(*buf);
 	sm = (sequence_magic *) PageGetSpecialPointer(page);
 
 	if (sm->magic != SEQ_MAGIC)
@@ -972,7 +947,7 @@ read_info(SeqTable elm, Relation rel, Buffer *buf)
 
 	lp = PageGetItemId(page, FirstOffsetNumber);
 	Assert(ItemIdIsNormal(lp));
-	tuple.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+	tuple.t_data = (HeapTupleHeader) PageGetItem((Page) page, lp);
 
 	seq = (Form_pg_sequence) GETSTRUCT(&tuple);
 
@@ -994,8 +969,7 @@ static void
 init_params(List *options, bool isInit,
 			Form_pg_sequence new, List **owned_by)
 {
-	DefElem    *start_value = NULL;
-	DefElem    *restart_value = NULL;
+	DefElem    *last_value = NULL;
 	DefElem    *increment_by = NULL;
 	DefElem    *max_value = NULL;
 	DefElem    *min_value = NULL;
@@ -1017,21 +991,18 @@ init_params(List *options, bool isInit,
 						 errmsg("conflicting or redundant options")));
 			increment_by = defel;
 		}
-		else if (strcmp(defel->defname, "start") == 0)
+
+		/*
+		 * start is for a new sequence restart is for alter
+		 */
+		else if (strcmp(defel->defname, "start") == 0 ||
+				 strcmp(defel->defname, "restart") == 0)
 		{
-			if (start_value)
+			if (last_value)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("conflicting or redundant options")));
-			start_value = defel;
-		}
-		else if (strcmp(defel->defname, "restart") == 0)
-		{
-			if (restart_value)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("conflicting or redundant options")));
-			restart_value = defel;
+			last_value = defel;
 		}
 		else if (strcmp(defel->defname, "maxvalue") == 0)
 		{
@@ -1136,60 +1107,23 @@ init_params(List *options, bool isInit,
 	}
 
 	/* START WITH */
-	if (start_value != NULL)
-		new->start_value = defGetInt64(start_value);
+	if (last_value != NULL)
+	{
+		new->last_value = defGetInt64(last_value);
+		new->is_called = false;
+		new->log_cnt = 1;
+	}
 	else if (isInit)
 	{
 		if (new->increment_by > 0)
-			new->start_value = new->min_value;	/* ascending seq */
+			new->last_value = new->min_value;	/* ascending seq */
 		else
-			new->start_value = new->max_value;	/* descending seq */
-	}
-
-	/* crosscheck START */
-	if (new->start_value < new->min_value)
-	{
-		char		bufs[100],
-					bufm[100];
-
-		snprintf(bufs, sizeof(bufs), INT64_FORMAT, new->start_value);
-		snprintf(bufm, sizeof(bufm), INT64_FORMAT, new->min_value);
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("START value (%s) cannot be less than MINVALUE (%s)",
-						bufs, bufm)));
-	}
-	if (new->start_value > new->max_value)
-	{
-		char		bufs[100],
-					bufm[100];
-
-		snprintf(bufs, sizeof(bufs), INT64_FORMAT, new->start_value);
-		snprintf(bufm, sizeof(bufm), INT64_FORMAT, new->max_value);
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			  errmsg("START value (%s) cannot be greater than MAXVALUE (%s)",
-					 bufs, bufm)));
-	}
-
-	/* RESTART [WITH] */
-	if (restart_value != NULL)
-	{
-		if (restart_value->arg != NULL)
-			new->last_value = defGetInt64(restart_value);
-		else
-			new->last_value = new->start_value;
-		new->is_called = false;
-		new->log_cnt = 1;
-	}
-	else if (isInit)
-	{
-		new->last_value = new->start_value;
+			new->last_value = new->max_value;	/* descending seq */
 		new->is_called = false;
 		new->log_cnt = 1;
 	}
 
-	/* crosscheck RESTART (or current value, if changing MIN/MAX) */
+	/* crosscheck */
 	if (new->last_value < new->min_value)
 	{
 		char		bufs[100],
@@ -1199,8 +1133,8 @@ init_params(List *options, bool isInit,
 		snprintf(bufm, sizeof(bufm), INT64_FORMAT, new->min_value);
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			   errmsg("RESTART value (%s) cannot be less than MINVALUE (%s)",
-					  bufs, bufm)));
+				 errmsg("START value (%s) cannot be less than MINVALUE (%s)",
+						bufs, bufm)));
 	}
 	if (new->last_value > new->max_value)
 	{
@@ -1211,8 +1145,8 @@ init_params(List *options, bool isInit,
 		snprintf(bufm, sizeof(bufm), INT64_FORMAT, new->max_value);
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			errmsg("RESTART value (%s) cannot be greater than MAXVALUE (%s)",
-				   bufs, bufm)));
+			  errmsg("START value (%s) cannot be greater than MAXVALUE (%s)",
+					 bufs, bufm)));
 	}
 
 	/* CACHE */
@@ -1332,6 +1266,7 @@ void
 seq_redo(XLogRecPtr lsn, XLogRecord *record)
 {
 	uint8		info = record->xl_info & ~XLR_INFO_MASK;
+	Relation	reln;
 	Buffer		buffer;
 	Page		page;
 	char	   *item;
@@ -1339,13 +1274,11 @@ seq_redo(XLogRecPtr lsn, XLogRecord *record)
 	xl_seq_rec *xlrec = (xl_seq_rec *) XLogRecGetData(record);
 	sequence_magic *sm;
 
-	/* Backup blocks are not used in seq records */
-	Assert(!(record->xl_info & XLR_BKP_BLOCK_MASK));
-
 	if (info != XLOG_SEQ_LOG)
 		elog(PANIC, "seq_redo: unknown op code %u", info);
 
-	buffer = XLogReadBuffer(xlrec->node, 0, true);
+	reln = XLogOpenRelation(xlrec->node);
+	buffer = XLogReadBuffer(reln, 0, true);
 	Assert(BufferIsValid(buffer));
 	page = (Page) BufferGetPage(buffer);
 

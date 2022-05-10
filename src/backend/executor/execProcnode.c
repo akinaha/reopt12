@@ -7,12 +7,12 @@
  *	 ExecProcNode, or ExecEndNode on its subnodes and do the appropriate
  *	 processing.
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/execProcnode.c,v 1.65 2009/01/01 17:23:41 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/executor/execProcnode.c,v 1.62 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -85,7 +85,6 @@
 #include "executor/nodeBitmapHeapscan.h"
 #include "executor/nodeBitmapIndexscan.h"
 #include "executor/nodeBitmapOr.h"
-#include "executor/nodeCtescan.h"
 #include "executor/nodeFunctionscan.h"
 #include "executor/nodeGroup.h"
 #include "executor/nodeHash.h"
@@ -95,7 +94,6 @@
 #include "executor/nodeMaterial.h"
 #include "executor/nodeMergejoin.h"
 #include "executor/nodeNestloop.h"
-#include "executor/nodeRecursiveunion.h"
 #include "executor/nodeResult.h"
 #include "executor/nodeSeqscan.h"
 #include "executor/nodeSetOp.h"
@@ -105,10 +103,7 @@
 #include "executor/nodeTidscan.h"
 #include "executor/nodeUnique.h"
 #include "executor/nodeValuesscan.h"
-#include "executor/nodeWindowAgg.h"
-#include "executor/nodeWorktablescan.h"
 #include "miscadmin.h"
-
 
 /* ------------------------------------------------------------------------
  *		ExecInitNode
@@ -150,11 +145,6 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 		case T_Append:
 			result = (PlanState *) ExecInitAppend((Append *) node,
 												  estate, eflags);
-			break;
-
-		case T_RecursiveUnion:
-			result = (PlanState *) ExecInitRecursiveUnion((RecursiveUnion *) node,
-														  estate, eflags);
 			break;
 
 		case T_BitmapAnd:
@@ -210,16 +200,6 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 													  estate, eflags);
 			break;
 
-		case T_CteScan:
-			result = (PlanState *) ExecInitCteScan((CteScan *) node,
-												   estate, eflags);
-			break;
-
-		case T_WorkTableScan:
-			result = (PlanState *) ExecInitWorkTableScan((WorkTableScan *) node,
-														 estate, eflags);
-			break;
-
 			/*
 			 * join nodes
 			 */
@@ -259,11 +239,6 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 		case T_Agg:
 			result = (PlanState *) ExecInitAgg((Agg *) node,
 											   estate, eflags);
-			break;
-
-		case T_WindowAgg:
-			result = (PlanState *) ExecInitWindowAgg((WindowAgg *) node,
-													 estate, eflags);
 			break;
 
 		case T_Unique:
@@ -348,10 +323,6 @@ ExecProcNode(PlanState *node)
 			result = ExecAppend((AppendState *) node);
 			break;
 
-		case T_RecursiveUnionState:
-			result = ExecRecursiveUnion((RecursiveUnionState *) node);
-			break;
-
 			/* BitmapAndState does not yield tuples */
 
 			/* BitmapOrState does not yield tuples */
@@ -389,14 +360,6 @@ ExecProcNode(PlanState *node)
 			result = ExecValuesScan((ValuesScanState *) node);
 			break;
 
-		case T_CteScanState:
-			result = ExecCteScan((CteScanState *) node);
-			break;
-
-		case T_WorkTableScanState:
-			result = ExecWorkTableScan((WorkTableScanState *) node);
-			break;
-
 			/*
 			 * join nodes
 			 */
@@ -429,10 +392,6 @@ ExecProcNode(PlanState *node)
 
 		case T_AggState:
 			result = ExecAgg((AggState *) node);
-			break;
-
-		case T_WindowAggState:
-			result = ExecWindowAgg((WindowAggState *) node);
 			break;
 
 		case T_UniqueState:
@@ -542,9 +501,6 @@ ExecCountSlotsNode(Plan *node)
 		case T_Append:
 			return ExecCountSlotsAppend((Append *) node);
 
-		case T_RecursiveUnion:
-			return ExecCountSlotsRecursiveUnion((RecursiveUnion *) node);
-
 		case T_BitmapAnd:
 			return ExecCountSlotsBitmapAnd((BitmapAnd *) node);
 
@@ -578,12 +534,6 @@ ExecCountSlotsNode(Plan *node)
 		case T_ValuesScan:
 			return ExecCountSlotsValuesScan((ValuesScan *) node);
 
-		case T_CteScan:
-			return ExecCountSlotsCteScan((CteScan *) node);
-
-		case T_WorkTableScan:
-			return ExecCountSlotsWorkTableScan((WorkTableScan *) node);
-
 			/*
 			 * join nodes
 			 */
@@ -610,10 +560,6 @@ ExecCountSlotsNode(Plan *node)
 
 		case T_Agg:
 			return ExecCountSlotsAgg((Agg *) node);
-
-		case T_WindowAgg:
-			return ExecCountSlotsWindowAgg((WindowAgg *) node);
-			break;
 
 		case T_Unique:
 			return ExecCountSlotsUnique((Unique *) node);
@@ -674,10 +620,6 @@ ExecEndNode(PlanState *node)
 			ExecEndAppend((AppendState *) node);
 			break;
 
-		case T_RecursiveUnionState:
-			ExecEndRecursiveUnion((RecursiveUnionState *) node);
-			break;
-
 		case T_BitmapAndState:
 			ExecEndBitmapAnd((BitmapAndState *) node);
 			break;
@@ -721,14 +663,6 @@ ExecEndNode(PlanState *node)
 			ExecEndValuesScan((ValuesScanState *) node);
 			break;
 
-		case T_CteScanState:
-			ExecEndCteScan((CteScanState *) node);
-			break;
-
-		case T_WorkTableScanState:
-			ExecEndWorkTableScan((WorkTableScanState *) node);
-			break;
-
 			/*
 			 * join nodes
 			 */
@@ -761,10 +695,6 @@ ExecEndNode(PlanState *node)
 
 		case T_AggState:
 			ExecEndAgg((AggState *) node);
-			break;
-
-		case T_WindowAggState:
-			ExecEndWindowAgg((WindowAggState *) node);
 			break;
 
 		case T_UniqueState:

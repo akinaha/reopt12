@@ -5,12 +5,12 @@
  *	  Routines for CREATE and DROP FUNCTION commands and CREATE and DROP
  *	  CAST commands.
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/functioncmds.c,v 1.110 2009/06/11 14:48:55 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/functioncmds.c,v 1.88 2008/01/01 19:45:49 momjian Exp $
  *
  * DESCRIPTION
  *	  These routines take the parse tree and pick out the
@@ -34,7 +34,6 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
-#include "access/sysattr.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_aggregate.h"
@@ -42,15 +41,10 @@
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
-#include "catalog/pg_proc_fn.h"
 #include "catalog/pg_type.h"
-#include "catalog/pg_type_fn.h"
 #include "commands/defrem.h"
 #include "commands/proclang.h"
 #include "miscadmin.h"
-#include "optimizer/var.h"
-#include "parser/parse_coerce.h"
-#include "parser/parse_expr.h"
 #include "parser/parse_func.h"
 #include "parser/parse_type.h"
 #include "utils/acl.h"
@@ -58,9 +52,7 @@
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
-#include "utils/rel.h"
 #include "utils/syscache.h"
-#include "utils/tqual.h"
 
 
 static void AlterFunctionOwner_internal(Relation rel, HeapTuple tup,
@@ -144,7 +136,7 @@ compute_return_type(TypeName *returnType, Oid languageOid,
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, ACL_KIND_NAMESPACE,
 						   get_namespace_name(namespaceId));
-		rettype = TypeShellMake(typname, namespaceId, GetUserId());
+		rettype = TypeShellMake(typname, namespaceId);
 		Assert(OidIsValid(rettype));
 	}
 
@@ -162,12 +154,10 @@ compute_return_type(TypeName *returnType, Oid languageOid,
  */
 static void
 examine_parameter_list(List *parameters, Oid languageOid,
-					   const char *queryString,
 					   oidvector **parameterTypes,
 					   ArrayType **allParameterTypes,
 					   ArrayType **parameterModes,
 					   ArrayType **parameterNames,
-					   List **parameterDefaults,
 					   Oid *requiredResultType)
 {
 	int			parameterCount = list_length(parameters);
@@ -177,12 +167,9 @@ examine_parameter_list(List *parameters, Oid languageOid,
 	Datum	   *paramModes;
 	Datum	   *paramNames;
 	int			outCount = 0;
-	int			varCount = 0;
 	bool		have_names = false;
-	bool		have_defaults = false;
 	ListCell   *x;
 	int			i;
-	ParseState *pstate;
 
 	*requiredResultType = InvalidOid;	/* default result */
 
@@ -190,11 +177,6 @@ examine_parameter_list(List *parameters, Oid languageOid,
 	allTypes = (Datum *) palloc(parameterCount * sizeof(Datum));
 	paramModes = (Datum *) palloc(parameterCount * sizeof(Datum));
 	paramNames = (Datum *) palloc0(parameterCount * sizeof(Datum));
-	*parameterDefaults = NIL;
-
-	/* may need a pstate for parse analysis of default exprs */
-	pstate = make_parsestate(NULL);
-	pstate->p_sourcetext = queryString;
 
 	/* Scan the list and extract data into work arrays */
 	i = 0;
@@ -202,7 +184,6 @@ examine_parameter_list(List *parameters, Oid languageOid,
 	{
 		FunctionParameter *fp = (FunctionParameter *) lfirst(x);
 		TypeName   *t = fp->argType;
-		bool		isinput = false;
 		Oid			toid;
 		Type		typtup;
 
@@ -240,43 +221,14 @@ examine_parameter_list(List *parameters, Oid languageOid,
 					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
 					 errmsg("functions cannot accept set arguments")));
 
-		/* handle input parameters */
-		if (fp->mode != FUNC_PARAM_OUT && fp->mode != FUNC_PARAM_TABLE)
-		{
-			/* other input parameters can't follow a VARIADIC parameter */
-			if (varCount > 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("VARIADIC parameter must be the last input parameter")));
+		if (fp->mode != FUNC_PARAM_OUT)
 			inTypes[inCount++] = toid;
-			isinput = true;
-		}
 
-		/* handle output parameters */
-		if (fp->mode != FUNC_PARAM_IN && fp->mode != FUNC_PARAM_VARIADIC)
+		if (fp->mode != FUNC_PARAM_IN)
 		{
-			if (outCount == 0)	/* save first output param's type */
+			if (outCount == 0)	/* save first OUT param's type */
 				*requiredResultType = toid;
 			outCount++;
-		}
-
-		if (fp->mode == FUNC_PARAM_VARIADIC)
-		{
-			varCount++;
-			/* validate variadic parameter type */
-			switch (toid)
-			{
-				case ANYARRAYOID:
-				case ANYOID:
-					/* okay */
-					break;
-				default:
-					if (!OidIsValid(get_element_type(toid)))
-						ereport(ERROR,
-								(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-							 errmsg("VARIADIC parameter must be an array")));
-					break;
-			}
 		}
 
 		allTypes[i] = ObjectIdGetDatum(toid);
@@ -285,75 +237,18 @@ examine_parameter_list(List *parameters, Oid languageOid,
 
 		if (fp->name && fp->name[0])
 		{
-			paramNames[i] = CStringGetTextDatum(fp->name);
+			paramNames[i] = DirectFunctionCall1(textin,
+												CStringGetDatum(fp->name));
 			have_names = true;
-		}
-
-		if (fp->defexpr)
-		{
-			Node	   *def;
-
-			if (!isinput)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-				   errmsg("only input parameters can have default values")));
-
-			def = transformExpr(pstate, fp->defexpr);
-			def = coerce_to_specific_type(pstate, def, toid, "DEFAULT");
-
-			/*
-			 * Make sure no variables are referred to.
-			 */
-			if (list_length(pstate->p_rtable) != 0 ||
-				contain_var_clause(def))
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-						 errmsg("cannot use table references in parameter default value")));
-
-			/*
-			 * It can't return a set either --- but coerce_to_specific_type
-			 * already checked that for us.
-			 *
-			 * No subplans or aggregates, either...
-			 *
-			 * Note: the point of these restrictions is to ensure that an
-			 * expression that, on its face, hasn't got subplans, aggregates,
-			 * etc cannot suddenly have them after function default arguments
-			 * are inserted.
-			 */
-			if (pstate->p_hasSubLinks)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				  errmsg("cannot use subquery in parameter default value")));
-			if (pstate->p_hasAggs)
-				ereport(ERROR,
-						(errcode(ERRCODE_GROUPING_ERROR),
-						 errmsg("cannot use aggregate function in parameter default value")));
-			if (pstate->p_hasWindowFuncs)
-				ereport(ERROR,
-						(errcode(ERRCODE_WINDOWING_ERROR),
-						 errmsg("cannot use window function in parameter default value")));
-
-			*parameterDefaults = lappend(*parameterDefaults, def);
-			have_defaults = true;
-		}
-		else
-		{
-			if (isinput && have_defaults)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("input parameters after one with a default value must also have defaults")));
 		}
 
 		i++;
 	}
 
-	free_parsestate(pstate);
-
 	/* Now construct the proper outputs as needed */
 	*parameterTypes = buildoidvector(inTypes, inCount);
 
-	if (outCount > 0 || varCount > 0)
+	if (outCount > 0)
 	{
 		*allParameterTypes = construct_array(allTypes, parameterCount, OIDOID,
 											 sizeof(Oid), true, 'i');
@@ -374,7 +269,8 @@ examine_parameter_list(List *parameters, Oid languageOid,
 		for (i = 0; i < parameterCount; i++)
 		{
 			if (paramNames[i] == PointerGetDatum(NULL))
-				paramNames[i] = CStringGetTextDatum("");
+				paramNames[i] = DirectFunctionCall1(textin,
+													CStringGetDatum(""));
 		}
 		*parameterNames = construct_array(paramNames, parameterCount, TEXTOID,
 										  -1, false, 'i');
@@ -511,7 +407,6 @@ static void
 compute_attributes_sql_style(List *options,
 							 List **as,
 							 char **language,
-							 bool *windowfunc_p,
 							 char *volatility_p,
 							 bool *strict_p,
 							 bool *security_definer,
@@ -522,7 +417,6 @@ compute_attributes_sql_style(List *options,
 	ListCell   *option;
 	DefElem    *as_item = NULL;
 	DefElem    *language_item = NULL;
-	DefElem    *windowfunc_item = NULL;
 	DefElem    *volatility_item = NULL;
 	DefElem    *strict_item = NULL;
 	DefElem    *security_item = NULL;
@@ -549,14 +443,6 @@ compute_attributes_sql_style(List *options,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("conflicting or redundant options")));
 			language_item = defel;
-		}
-		else if (strcmp(defel->defname, "window") == 0)
-		{
-			if (windowfunc_item)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("conflicting or redundant options")));
-			windowfunc_item = defel;
 		}
 		else if (compute_common_attribute(defel,
 										  &volatility_item,
@@ -596,8 +482,6 @@ compute_attributes_sql_style(List *options,
 	}
 
 	/* process optional items */
-	if (windowfunc_item)
-		*windowfunc_p = intVal(windowfunc_item->arg);
 	if (volatility_item)
 		*volatility_p = interpret_func_volatility(volatility_item);
 	if (strict_item)
@@ -675,8 +559,7 @@ compute_attributes_with_style(List *parameters, bool *isStrict_p, char *volatili
  *	   AS <object reference, or sql code>
  */
 static void
-interpret_AS_clause(Oid languageOid, const char *languageName,
-					char *funcname, List *as,
+interpret_AS_clause(Oid languageOid, const char *languageName, List *as,
 					char **prosrc_str_p, char **probin_str_p)
 {
 	Assert(as != NIL);
@@ -685,47 +568,25 @@ interpret_AS_clause(Oid languageOid, const char *languageName,
 	{
 		/*
 		 * For "C" language, store the file name in probin and, when given,
-		 * the link symbol name in prosrc.	If link symbol is omitted,
-		 * substitute procedure name.  We also allow link symbol to be
-		 * specified as "-", since that was the habit in PG versions before
-		 * 8.4, and there might be dump files out there that don't translate
-		 * that back to "omitted".
+		 * the link symbol name in prosrc.
 		 */
 		*probin_str_p = strVal(linitial(as));
 		if (list_length(as) == 1)
-			*prosrc_str_p = funcname;
+			*prosrc_str_p = "-";
 		else
-		{
 			*prosrc_str_p = strVal(lsecond(as));
-			if (strcmp(*prosrc_str_p, "-") == 0)
-				*prosrc_str_p = funcname;
-		}
 	}
 	else
 	{
 		/* Everything else wants the given string in prosrc. */
 		*prosrc_str_p = strVal(linitial(as));
-		*probin_str_p = NULL;
+		*probin_str_p = "-";
 
 		if (list_length(as) != 1)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
 					 errmsg("only one AS item needed for language \"%s\"",
 							languageName)));
-
-		if (languageOid == INTERNALlanguageId)
-		{
-			/*
-			 * In PostgreSQL versions before 6.5, the SQL name of the created
-			 * function could not be different from the internal name, and
-			 * "prosrc" wasn't used.  So there is code out there that does
-			 * CREATE FUNCTION xyz AS '' LANGUAGE internal. To preserve some
-			 * modicum of backwards compatibility, accept an empty "prosrc"
-			 * value as meaning the supplied SQL function name.
-			 */
-			if (strlen(*prosrc_str_p) == 0)
-				*prosrc_str_p = funcname;
-		}
 	}
 }
 
@@ -736,7 +597,7 @@ interpret_AS_clause(Oid languageOid, const char *languageName,
  *	 Execute a CREATE FUNCTION utility statement.
  */
 void
-CreateFunction(CreateFunctionStmt *stmt, const char *queryString)
+CreateFunction(CreateFunctionStmt *stmt)
 {
 	char	   *probin_str;
 	char	   *prosrc_str;
@@ -753,10 +614,8 @@ CreateFunction(CreateFunctionStmt *stmt, const char *queryString)
 	ArrayType  *allParameterTypes;
 	ArrayType  *parameterModes;
 	ArrayType  *parameterNames;
-	List	   *parameterDefaults;
 	Oid			requiredResultType;
-	bool		isWindowFunc,
-				isStrict,
+	bool		isStrict,
 				security;
 	char		volatility;
 	ArrayType  *proconfig;
@@ -777,7 +636,6 @@ CreateFunction(CreateFunctionStmt *stmt, const char *queryString)
 					   get_namespace_name(namespaceId));
 
 	/* default attributes */
-	isWindowFunc = false;
 	isStrict = false;
 	security = false;
 	volatility = PROVOLATILE_VOLATILE;
@@ -788,8 +646,7 @@ CreateFunction(CreateFunctionStmt *stmt, const char *queryString)
 	/* override attributes from explicit list */
 	compute_attributes_sql_style(stmt->options,
 								 &as_clause, &language,
-								 &isWindowFunc, &volatility,
-								 &isStrict, &security,
+								 &volatility, &isStrict, &security,
 								 &proconfig, &procost, &prorows);
 
 	/* Convert language name to canonical case */
@@ -835,12 +692,11 @@ CreateFunction(CreateFunctionStmt *stmt, const char *queryString)
 	 * Convert remaining parameters of CREATE to form wanted by
 	 * ProcedureCreate.
 	 */
-	examine_parameter_list(stmt->parameters, languageOid, queryString,
+	examine_parameter_list(stmt->parameters, languageOid,
 						   &parameterTypes,
 						   &allParameterTypes,
 						   &parameterModes,
 						   &parameterNames,
-						   &parameterDefaults,
 						   &requiredResultType);
 
 	if (stmt->returnType)
@@ -872,8 +728,29 @@ CreateFunction(CreateFunctionStmt *stmt, const char *queryString)
 
 	compute_attributes_with_style(stmt->withClause, &isStrict, &volatility);
 
-	interpret_AS_clause(languageOid, languageName, funcname, as_clause,
+	interpret_AS_clause(languageOid, languageName, as_clause,
 						&prosrc_str, &probin_str);
+
+	if (languageOid == INTERNALlanguageId)
+	{
+		/*
+		 * In PostgreSQL versions before 6.5, the SQL name of the created
+		 * function could not be different from the internal name, and
+		 * "prosrc" wasn't used.  So there is code out there that does CREATE
+		 * FUNCTION xyz AS '' LANGUAGE internal. To preserve some modicum of
+		 * backwards compatibility, accept an empty "prosrc" value as meaning
+		 * the supplied SQL function name.
+		 */
+		if (strlen(prosrc_str) == 0)
+			prosrc_str = funcname;
+	}
+
+	if (languageOid == ClanguageId)
+	{
+		/* If link symbol is specified as "-", substitute procedure name */
+		if (strcmp(prosrc_str, "-") == 0)
+			prosrc_str = funcname;
+	}
 
 	/*
 	 * Set default values for COST and ROWS depending on other parameters;
@@ -915,7 +792,6 @@ CreateFunction(CreateFunctionStmt *stmt, const char *queryString)
 					prosrc_str, /* converted to text later */
 					probin_str, /* converted to text later */
 					false,		/* not an aggregate */
-					isWindowFunc,
 					security,
 					isStrict,
 					volatility,
@@ -923,7 +799,6 @@ CreateFunction(CreateFunctionStmt *stmt, const char *queryString)
 					PointerGetDatum(allParameterTypes),
 					PointerGetDatum(parameterModes),
 					PointerGetDatum(parameterNames),
-					parameterDefaults,
 					PointerGetDatum(proconfig),
 					procost,
 					prorows);
@@ -1194,8 +1069,8 @@ AlterFunctionOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 	if (procForm->proowner != newOwnerId)
 	{
 		Datum		repl_val[Natts_pg_proc];
-		bool		repl_null[Natts_pg_proc];
-		bool		repl_repl[Natts_pg_proc];
+		char		repl_null[Natts_pg_proc];
+		char		repl_repl[Natts_pg_proc];
 		Acl		   *newAcl;
 		Datum		aclDatum;
 		bool		isNull;
@@ -1221,10 +1096,10 @@ AlterFunctionOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 							   get_namespace_name(procForm->pronamespace));
 		}
 
-		memset(repl_null, false, sizeof(repl_null));
-		memset(repl_repl, false, sizeof(repl_repl));
+		memset(repl_null, ' ', sizeof(repl_null));
+		memset(repl_repl, ' ', sizeof(repl_repl));
 
-		repl_repl[Anum_pg_proc_proowner - 1] = true;
+		repl_repl[Anum_pg_proc_proowner - 1] = 'r';
 		repl_val[Anum_pg_proc_proowner - 1] = ObjectIdGetDatum(newOwnerId);
 
 		/*
@@ -1238,12 +1113,12 @@ AlterFunctionOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 		{
 			newAcl = aclnewowner(DatumGetAclP(aclDatum),
 								 procForm->proowner, newOwnerId);
-			repl_repl[Anum_pg_proc_proacl - 1] = true;
+			repl_repl[Anum_pg_proc_proacl - 1] = 'r';
 			repl_val[Anum_pg_proc_proacl - 1] = PointerGetDatum(newAcl);
 		}
 
-		newtuple = heap_modify_tuple(tup, RelationGetDescr(rel), repl_val,
-									 repl_null, repl_repl);
+		newtuple = heap_modifytuple(tup, RelationGetDescr(rel), repl_val,
+									repl_null, repl_repl);
 
 		simple_heap_update(rel, &newtuple->t_self, newtuple);
 		CatalogUpdateIndexes(rel, newtuple);
@@ -1349,8 +1224,8 @@ AlterFunction(AlterFunctionStmt *stmt)
 		bool		isnull;
 		ArrayType  *a;
 		Datum		repl_val[Natts_pg_proc];
-		bool		repl_null[Natts_pg_proc];
-		bool		repl_repl[Natts_pg_proc];
+		char		repl_null[Natts_pg_proc];
+		char		repl_repl[Natts_pg_proc];
 
 		/* extract existing proconfig setting */
 		datum = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_proconfig, &isnull);
@@ -1360,22 +1235,22 @@ AlterFunction(AlterFunctionStmt *stmt)
 		a = update_proconfig_value(a, set_items);
 
 		/* update the tuple */
-		memset(repl_repl, false, sizeof(repl_repl));
-		repl_repl[Anum_pg_proc_proconfig - 1] = true;
+		memset(repl_repl, ' ', sizeof(repl_repl));
+		repl_repl[Anum_pg_proc_proconfig - 1] = 'r';
 
 		if (a == NULL)
 		{
 			repl_val[Anum_pg_proc_proconfig - 1] = (Datum) 0;
-			repl_null[Anum_pg_proc_proconfig - 1] = true;
+			repl_null[Anum_pg_proc_proconfig - 1] = 'n';
 		}
 		else
 		{
 			repl_val[Anum_pg_proc_proconfig - 1] = PointerGetDatum(a);
-			repl_null[Anum_pg_proc_proconfig - 1] = false;
+			repl_null[Anum_pg_proc_proconfig - 1] = ' ';
 		}
 
-		tup = heap_modify_tuple(tup, RelationGetDescr(rel),
-								repl_val, repl_null, repl_repl);
+		tup = heap_modifytuple(tup, RelationGetDescr(rel),
+							   repl_val, repl_null, repl_repl);
 	}
 
 	/* Do the update */
@@ -1470,32 +1345,27 @@ CreateCast(CreateCastStmt *stmt)
 {
 	Oid			sourcetypeid;
 	Oid			targettypeid;
-	char		sourcetyptype;
-	char		targettyptype;
 	Oid			funcid;
 	int			nargs;
 	char		castcontext;
-	char		castmethod;
 	Relation	relation;
 	HeapTuple	tuple;
 	Datum		values[Natts_pg_cast];
-	bool		nulls[Natts_pg_cast];
+	char		nulls[Natts_pg_cast];
 	ObjectAddress myself,
 				referenced;
 
 	sourcetypeid = typenameTypeId(NULL, stmt->sourcetype, NULL);
 	targettypeid = typenameTypeId(NULL, stmt->targettype, NULL);
-	sourcetyptype = get_typtype(sourcetypeid);
-	targettyptype = get_typtype(targettypeid);
 
 	/* No pseudo-types allowed */
-	if (sourcetyptype == TYPTYPE_PSEUDO)
+	if (get_typtype(sourcetypeid) == TYPTYPE_PSEUDO)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("source data type %s is a pseudo-type",
 						TypeNameToString(stmt->sourcetype))));
 
-	if (targettyptype == TYPTYPE_PSEUDO)
+	if (get_typtype(targettypeid) == TYPTYPE_PSEUDO)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("target data type %s is a pseudo-type",
@@ -1507,18 +1377,10 @@ CreateCast(CreateCastStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be owner of type %s or type %s",
-						format_type_be(sourcetypeid),
-						format_type_be(targettypeid))));
+						TypeNameToString(stmt->sourcetype),
+						TypeNameToString(stmt->targettype))));
 
-	/* Detemine the cast method */
 	if (stmt->func != NULL)
-		castmethod = COERCION_METHOD_FUNCTION;
-	else if (stmt->inout)
-		castmethod = COERCION_METHOD_INOUT;
-	else
-		castmethod = COERCION_METHOD_BINARY;
-
-	if (castmethod == COERCION_METHOD_FUNCTION)
 	{
 		Form_pg_proc procstruct;
 
@@ -1538,10 +1400,10 @@ CreateCast(CreateCastStmt *stmt)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 				  errmsg("cast function must take one to three arguments")));
-		if (!IsBinaryCoercible(sourcetypeid, procstruct->proargtypes.values[0]))
+		if (procstruct->proargtypes.values[0] != sourcetypeid)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("argument of cast function must match or be binary-coercible from source data type")));
+			errmsg("argument of cast function must match source data type")));
 		if (nargs > 1 && procstruct->proargtypes.values[1] != INT4OID)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
@@ -1550,10 +1412,10 @@ CreateCast(CreateCastStmt *stmt)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 			errmsg("third argument of cast function must be type boolean")));
-		if (!IsBinaryCoercible(procstruct->prorettype, targettypeid))
+		if (procstruct->prorettype != targettypeid)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("return data type of cast function must match or be binary-coercible to target data type")));
+					 errmsg("return data type of cast function must match target data type")));
 
 		/*
 		 * Restricting the volatility of a cast function may or may not be a
@@ -1570,10 +1432,6 @@ CreateCast(CreateCastStmt *stmt)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 				 errmsg("cast function must not be an aggregate function")));
-		if (procstruct->proiswindow)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("cast function must not be a window function")));
 		if (procstruct->proretset)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
@@ -1583,18 +1441,16 @@ CreateCast(CreateCastStmt *stmt)
 	}
 	else
 	{
-		funcid = InvalidOid;
-		nargs = 0;
-	}
-
-	if (castmethod == COERCION_METHOD_BINARY)
-	{
 		int16		typ1len;
 		int16		typ2len;
 		bool		typ1byval;
 		bool		typ2byval;
 		char		typ1align;
 		char		typ2align;
+
+		/* indicates binary coercibility */
+		funcid = InvalidOid;
+		nargs = 0;
 
 		/*
 		 * Must be superuser to create binary-compatible casts, since
@@ -1619,33 +1475,6 @@ CreateCast(CreateCastStmt *stmt)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("source and target data types are not physically compatible")));
-
-		/*
-		 * We know that composite, enum and array types are never binary-
-		 * compatible with each other.	They all have OIDs embedded in them.
-		 *
-		 * Theoretically you could build a user-defined base type that is
-		 * binary-compatible with a composite, enum, or array type.  But we
-		 * disallow that too, as in practice such a cast is surely a mistake.
-		 * You can always work around that by writing a cast function.
-		 */
-		if (sourcetyptype == TYPTYPE_COMPOSITE ||
-			targettyptype == TYPTYPE_COMPOSITE)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				  errmsg("composite data types are not binary-compatible")));
-
-		if (sourcetyptype == TYPTYPE_ENUM ||
-			targettyptype == TYPTYPE_ENUM)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("enum data types are not binary-compatible")));
-
-		if (OidIsValid(get_element_type(sourcetypeid)) ||
-			OidIsValid(get_element_type(targettypeid)))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("array data types are not binary-compatible")));
 	}
 
 	/*
@@ -1690,19 +1519,18 @@ CreateCast(CreateCastStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("cast from type %s to type %s already exists",
-						format_type_be(sourcetypeid),
-						format_type_be(targettypeid))));
+						TypeNameToString(stmt->sourcetype),
+						TypeNameToString(stmt->targettype))));
 
 	/* ready to go */
 	values[Anum_pg_cast_castsource - 1] = ObjectIdGetDatum(sourcetypeid);
 	values[Anum_pg_cast_casttarget - 1] = ObjectIdGetDatum(targettypeid);
 	values[Anum_pg_cast_castfunc - 1] = ObjectIdGetDatum(funcid);
 	values[Anum_pg_cast_castcontext - 1] = CharGetDatum(castcontext);
-	values[Anum_pg_cast_castmethod - 1] = CharGetDatum(castmethod);
 
-	MemSet(nulls, false, sizeof(nulls));
+	MemSet(nulls, ' ', Natts_pg_cast);
 
-	tuple = heap_form_tuple(RelationGetDescr(relation), values, nulls);
+	tuple = heap_formtuple(RelationGetDescr(relation), values, nulls);
 
 	simple_heap_insert(relation, tuple);
 
@@ -1766,13 +1594,13 @@ DropCast(DropCastStmt *stmt)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
 					 errmsg("cast from type %s to type %s does not exist",
-							format_type_be(sourcetypeid),
-							format_type_be(targettypeid))));
+							TypeNameToString(stmt->sourcetype),
+							TypeNameToString(stmt->targettype))));
 		else
 			ereport(NOTICE,
 			 (errmsg("cast from type %s to type %s does not exist, skipping",
-					 format_type_be(sourcetypeid),
-					 format_type_be(targettypeid))));
+					 TypeNameToString(stmt->sourcetype),
+					 TypeNameToString(stmt->targettype))));
 
 		return;
 	}
@@ -1783,8 +1611,8 @@ DropCast(DropCastStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be owner of type %s or type %s",
-						format_type_be(sourcetypeid),
-						format_type_be(targettypeid))));
+						TypeNameToString(stmt->sourcetype),
+						TypeNameToString(stmt->targettype))));
 
 	/*
 	 * Do the deletion

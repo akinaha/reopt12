@@ -4,21 +4,19 @@
  *	  WAL replay logic for GiST.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *			 $PostgreSQL: pgsql/src/backend/access/gist/gistxlog.c,v 1.32.2.1 2009/12/24 17:52:11 tgl Exp $
+ *			 $PostgreSQL: pgsql/src/backend/access/gist/gistxlog.c,v 1.27 2008/01/01 19:45:46 momjian Exp $
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
 #include "access/gist_private.h"
-#include "access/xlogutils.h"
+#include "access/heapam.h"
 #include "miscadmin.h"
-#include "storage/bufmgr.h"
 #include "utils/memutils.h"
-#include "utils/rel.h"
 
 
 typedef struct
@@ -190,6 +188,7 @@ gistRedoPageUpdateRecord(XLogRecPtr lsn, XLogRecord *record, bool isnewroot)
 {
 	gistxlogPageUpdate *xldata = (gistxlogPageUpdate *) XLogRecGetData(record);
 	PageUpdateRecord xlrec;
+	Relation	reln;
 	Buffer		buffer;
 	Page		page;
 
@@ -208,7 +207,8 @@ gistRedoPageUpdateRecord(XLogRecPtr lsn, XLogRecord *record, bool isnewroot)
 
 	decodePageUpdateRecord(&xlrec, record);
 
-	buffer = XLogReadBuffer(xlrec.data->node, xlrec.data->blkno, false);
+	reln = XLogOpenRelation(xlrec.data->node);
+	buffer = XLogReadBuffer(reln, xlrec.data->blkno, false);
 	if (!BufferIsValid(buffer))
 		return;
 	page = (Page) BufferGetPage(buffer);
@@ -233,7 +233,7 @@ gistRedoPageUpdateRecord(XLogRecPtr lsn, XLogRecord *record, bool isnewroot)
 
 	/* add tuples */
 	if (xlrec.len > 0)
-		gistfillbuffer(page, xlrec.itup, xlrec.len, InvalidOffsetNumber);
+		gistfillbuffer(reln, page, xlrec.itup, xlrec.len, InvalidOffsetNumber);
 
 	/*
 	 * special case: leafpage, nothing to insert, nothing to delete, then
@@ -261,6 +261,7 @@ static void
 gistRedoPageDeleteRecord(XLogRecPtr lsn, XLogRecord *record)
 {
 	gistxlogPageDelete *xldata = (gistxlogPageDelete *) XLogRecGetData(record);
+	Relation	reln;
 	Buffer		buffer;
 	Page		page;
 
@@ -268,7 +269,8 @@ gistRedoPageDeleteRecord(XLogRecPtr lsn, XLogRecord *record)
 	if (record->xl_info & XLR_BKP_BLOCK_1)
 		return;
 
-	buffer = XLogReadBuffer(xldata->node, xldata->blkno, false);
+	reln = XLogOpenRelation(xldata->node);
+	buffer = XLogReadBuffer(reln, xldata->blkno, false);
 	if (!BufferIsValid(buffer))
 		return;
 
@@ -316,12 +318,14 @@ static void
 gistRedoPageSplitRecord(XLogRecPtr lsn, XLogRecord *record)
 {
 	PageSplitRecord xlrec;
+	Relation	reln;
 	Buffer		buffer;
 	Page		page;
 	int			i;
 	int			flags;
 
 	decodePageSplitRecord(&xlrec, record);
+	reln = XLogOpenRelation(xlrec.data->node);
 	flags = xlrec.data->origleaf ? F_LEAF : 0;
 
 	/* loop around all pages */
@@ -329,7 +333,7 @@ gistRedoPageSplitRecord(XLogRecPtr lsn, XLogRecord *record)
 	{
 		NewPage    *newpage = xlrec.page + i;
 
-		buffer = XLogReadBuffer(xlrec.data->node, newpage->header->blkno, true);
+		buffer = XLogReadBuffer(reln, newpage->header->blkno, true);
 		Assert(BufferIsValid(buffer));
 		page = (Page) BufferGetPage(buffer);
 
@@ -337,7 +341,7 @@ gistRedoPageSplitRecord(XLogRecPtr lsn, XLogRecord *record)
 		GISTInitBuffer(buffer, flags);
 
 		/* and fill it */
-		gistfillbuffer(page, newpage->itup, newpage->header->num, FirstOffsetNumber);
+		gistfillbuffer(reln, page, newpage->itup, newpage->header->num, FirstOffsetNumber);
 
 		PageSetLSN(page, lsn);
 		PageSetTLI(page, ThisTimeLineID);
@@ -356,10 +360,12 @@ static void
 gistRedoCreateIndex(XLogRecPtr lsn, XLogRecord *record)
 {
 	RelFileNode *node = (RelFileNode *) XLogRecGetData(record);
+	Relation	reln;
 	Buffer		buffer;
 	Page		page;
 
-	buffer = XLogReadBuffer(*node, GIST_ROOT_BLKNO, true);
+	reln = XLogOpenRelation(*node);
+	buffer = XLogReadBuffer(reln, GIST_ROOT_BLKNO, true);
 	Assert(BufferIsValid(buffer));
 	page = (Page) BufferGetPage(buffer);
 
@@ -394,9 +400,8 @@ void
 gist_redo(XLogRecPtr lsn, XLogRecord *record)
 {
 	uint8		info = record->xl_info & ~XLR_INFO_MASK;
-	MemoryContext oldCxt;
 
-	RestoreBkpBlocks(lsn, record, false);
+	MemoryContext oldCxt;
 
 	oldCxt = MemoryContextSwitchTo(opCtx);
 	switch (info)
@@ -596,7 +601,7 @@ gistContinueInsert(gistIncompleteInsert *insert)
 				lenitup;
 	Relation	index;
 
-	index = CreateFakeRelcacheEntry(insert->node);
+	index = XLogOpenRelation(insert->node);
 
 	/*
 	 * needed vector itup never will be more than initial lenblkno+2, because
@@ -618,7 +623,7 @@ gistContinueInsert(gistIncompleteInsert *insert)
 		 * it was split root, so we should only make new root. it can't be
 		 * simple insert into root, we should replace all content of root.
 		 */
-		Buffer		buffer = XLogReadBuffer(insert->node, GIST_ROOT_BLKNO, true);
+		Buffer		buffer = XLogReadBuffer(index, GIST_ROOT_BLKNO, true);
 
 		gistnewroot(index, buffer, itup, lenitup, NULL);
 		UnlockReleaseBuffer(buffer);
@@ -644,7 +649,6 @@ gistContinueInsert(gistIncompleteInsert *insert)
 			int			j,
 						k,
 						pituplen = 0;
-			uint8		xlinfo;
 			XLogRecData *rdata;
 			XLogRecPtr	recptr;
 			Buffer		tempbuffer = InvalidBuffer;
@@ -698,7 +702,7 @@ gistContinueInsert(gistIncompleteInsert *insert)
 				LockBuffer(buffers[numbuffer], GIST_EXCLUSIVE);
 				GISTInitBuffer(buffers[numbuffer], 0);
 				pages[numbuffer] = BufferGetPage(buffers[numbuffer]);
-				gistfillbuffer(pages[numbuffer], itup, lenitup, FirstOffsetNumber);
+				gistfillbuffer(index, pages[numbuffer], itup, lenitup, FirstOffsetNumber);
 				numbuffer++;
 
 				if (BufferGetBlockNumber(buffers[0]) == GIST_ROOT_BLKNO)
@@ -733,7 +737,6 @@ gistContinueInsert(gistIncompleteInsert *insert)
 				for (j = 0; j < ntodelete; j++)
 					PageIndexTupleDelete(pages[0], todelete[j]);
 
-				xlinfo = XLOG_GIST_PAGE_SPLIT;
 				rdata = formSplitRdata(index->rd_node, insert->path[i],
 									   false, &(insert->key),
 									 gistMakePageLayout(buffers, numbuffer));
@@ -745,9 +748,8 @@ gistContinueInsert(gistIncompleteInsert *insert)
 
 				for (j = 0; j < ntodelete; j++)
 					PageIndexTupleDelete(pages[0], todelete[j]);
-				gistfillbuffer(pages[0], itup, lenitup, InvalidOffsetNumber);
+				gistfillbuffer(index, pages[0], itup, lenitup, InvalidOffsetNumber);
 
-				xlinfo = XLOG_GIST_PAGE_UPDATE;
 				rdata = formUpdateRdata(index->rd_node, buffers[0],
 										todelete, ntodelete,
 										itup, lenitup, &(insert->key));
@@ -764,7 +766,7 @@ gistContinueInsert(gistIncompleteInsert *insert)
 				GistPageGetOpaque(pages[j])->rightlink = InvalidBlockNumber;
 				MarkBufferDirty(buffers[j]);
 			}
-			recptr = XLogInsert(RM_GIST_ID, xlinfo, rdata);
+			recptr = XLogInsert(RM_GIST_ID, XLOG_GIST_PAGE_UPDATE, rdata);
 			for (j = 0; j < numbuffer; j++)
 			{
 				PageSetLSN(pages[j], recptr);
@@ -790,8 +792,6 @@ gistContinueInsert(gistIncompleteInsert *insert)
 			}
 		}
 	}
-
-	FreeFakeRelcacheEntry(index);
 
 	ereport(LOG,
 			(errmsg("index %u/%u/%u needs VACUUM FULL or REINDEX to finish crash recovery",
